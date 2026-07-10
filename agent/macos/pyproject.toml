@@ -1,0 +1,26 @@
+[project]
+name = "clipboard-relay-agent-mac"
+version = "0.1.0"
+description = "Mac user LaunchAgent for receiving clipboard text over WebSocket."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pyperclip>=1.9.0",
+  "websocket-client>=1.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clipboard_relay_agent"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
