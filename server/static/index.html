@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clipboard Relay</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f7f4;
+        color: #1d1d1f;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+      }
+
+      main {
+        box-sizing: border-box;
+        width: min(760px, 100%);
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      h1 {
+        margin: 10px 0 18px;
+        font-size: 24px;
+        font-weight: 700;
+      }
+
+      label {
+        display: block;
+        margin: 16px 0 8px;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      input,
+      select,
+      textarea,
+      button {
+        box-sizing: border-box;
+        width: 100%;
+        border-radius: 8px;
+        font: inherit;
+      }
+
+      input,
+      select,
+      textarea {
+        border: 1px solid #c8c8c2;
+        background: #ffffff;
+        color: inherit;
+        padding: 12px;
+      }
+
+      textarea {
+        min-height: 23vh;
+        resize: vertical;
+        line-height: 1.5;
+      }
+
+      button {
+        margin-top: 14px;
+        border: 0;
+        background: #185abc;
+        color: #ffffff;
+        padding: 13px 16px;
+        font-weight: 700;
+      }
+
+      .secondary {
+        background: transparent;
+        border: 1px solid #8d9298;
+        color: inherit;
+      }
+
+      button:disabled {
+        opacity: 0.62;
+      }
+
+      #status {
+        min-height: 24px;
+        margin-top: 14px;
+        font-size: 15px;
+      }
+
+      .ok {
+        color: #137333;
+      }
+
+      .bad {
+        color: #b3261e;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          background: #111315;
+          color: #f1f3f4;
+        }
+
+        input,
+        select,
+        textarea {
+          border-color: #4b4f54;
+          background: #1b1f23;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Clipboard Relay</h1>
+
+      <label for="apiKey">密钥</label>
+      <input id="apiKey" autocomplete="off" inputmode="text" type="password" />
+      <button id="clearKey" class="secondary" type="button">清除密钥</button>
+
+      <label for="target">目标设备</label>
+      <select id="target">
+        <option value="win-fukuoka">福冈 Windows</option>
+        <option value="mac-china">中国大陆 Mac</option>
+      </select>
+
+      <label for="text">文本</label>
+      <textarea id="text" autofocus></textarea>
+
+      <button id="send" type="button">发送到目标设备剪贴板</button>
+      <div id="status" aria-live="polite"></div>
+    </main>
+
+    <script>
+      const API_KEY_STORAGE_KEY = "clipboardRelayApiKey";
+      const TARGET_STORAGE_KEY = "clipboardRelayTarget";
+      const apiKeyInput = document.querySelector("#apiKey");
+      const targetSelect = document.querySelector("#target");
+      const textInput = document.querySelector("#text");
+      const sendButton = document.querySelector("#send");
+      const clearKeyButton = document.querySelector("#clearKey");
+      const statusEl = document.querySelector("#status");
+
+      const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (savedKey) {
+        apiKeyInput.value = savedKey;
+      }
+
+      const savedTarget = localStorage.getItem(TARGET_STORAGE_KEY);
+      if (savedTarget && targetSelect.querySelector(`option[value="${savedTarget}"]`)) {
+        targetSelect.value = savedTarget;
+      }
+
+      function setStatus(message, kind) {
+        statusEl.textContent = message;
+        statusEl.className = kind || "";
+      }
+
+      clearKeyButton.addEventListener("click", () => {
+        localStorage.removeItem(API_KEY_STORAGE_KEY);
+        apiKeyInput.value = "";
+        apiKeyInput.focus();
+        setStatus("密钥已清除。", "");
+      });
+
+      targetSelect.addEventListener("change", () => {
+        localStorage.setItem(TARGET_STORAGE_KEY, targetSelect.value);
+      });
+
+      sendButton.addEventListener("click", async () => {
+        const apiKey = apiKeyInput.value.trim();
+        const target = targetSelect.value;
+        const text = textInput.value;
+
+        if (!apiKey) {
+          setStatus("请输入密钥。", "bad");
+          return;
+        }
+
+        if (!text.trim()) {
+          setStatus("请输入要发送的文本。", "bad");
+          return;
+        }
+
+        localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+        localStorage.setItem(TARGET_STORAGE_KEY, target);
+        sendButton.disabled = true;
+        setStatus("发送中...", "");
+
+        try {
+          const response = await fetch("/api/send", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-API-Key": apiKey,
+            },
+            body: JSON.stringify({ target, text }),
+          });
+
+          if (response.ok) {
+            textInput.value = "";
+            setStatus("发送成功。", "ok");
+          } else if (response.status === 401) {
+            setStatus("密钥错误。", "bad");
+          } else if (response.status === 503) {
+            setStatus("目标设备未连接。", "bad");
+          } else if (response.status === 400) {
+            setStatus("请求格式错误或目标设备无效。", "bad");
+          } else {
+            setStatus(`发送失败：${response.status}`, "bad");
+          }
+        } catch (error) {
+          setStatus("网络连接失败。", "bad");
+        } finally {
+          sendButton.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
