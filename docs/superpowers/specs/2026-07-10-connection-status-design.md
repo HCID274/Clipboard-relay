@@ -34,7 +34,10 @@
 - **文件**：`server/app.py`
 - **鉴权**：要求 `X-API-Key`，与 `/api/send` 一致；缺失或错误返回 `401`；
   `API_KEY` 未配置返回 `500`。复用现有的 `check_api_key()`。
-- **返回**（`200`）：所有设备的在场布尔映射，数据来自 `agents.websockets` 的 key：
+- **返回**（`200`）：遍历 `DEVICES` 的每个 device_id，判断是否存在于
+  `agents.websockets` 中，得到所有设备的在场布尔映射（键必须来自 `DEVICES`
+  的全量列表，不能只用 `agents.websockets` 的 key——否则离线设备会从映射里
+  消失，破坏"返回全部设备"这一前提）：
 
   ```json
   {"devices": {"win-fukuoka": true, "mac-china": false}}
