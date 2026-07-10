@@ -80,16 +80,10 @@ def load_config() -> dict[str, Any]:
         logging.error("reconnect_seconds must be a positive number")
         sys.exit(1)
 
-    max_reconnect_attempts = config.get("max_reconnect_attempts", 60)
-    if not isinstance(max_reconnect_attempts, int) or max_reconnect_attempts <= 0:
-        logging.error("max_reconnect_attempts must be a positive integer")
-        sys.exit(1)
-
     return {
         "server_ws_url": server_ws_url,
         "api_key": api_key,
         "reconnect_seconds": float(reconnect_seconds),
-        "max_reconnect_attempts": max_reconnect_attempts,
     }
 
 
@@ -147,10 +141,9 @@ def run() -> None:
     setup_logging()
     config = load_config()
     reconnect_seconds = config["reconnect_seconds"]
-    max_reconnect_attempts = config["max_reconnect_attempts"]
     reconnect_attempts = 0
 
-    while reconnect_attempts < max_reconnect_attempts:
+    while True:
         opened = False
         started_at = time.monotonic()
 
@@ -186,20 +179,14 @@ def run() -> None:
         else:
             reconnect_attempts += 1
             logging.warning(
-                "reconnect attempt %d/%d after short or failed connection opened=%s duration=%.1f seconds",
+                "reconnect attempt %d after short or failed connection opened=%s duration=%.1f seconds",
                 reconnect_attempts,
-                max_reconnect_attempts,
                 opened,
                 connected_seconds,
             )
 
-        if reconnect_attempts >= max_reconnect_attempts:
-            break
-
         logging.info("reconnecting in %.1f seconds", reconnect_seconds)
         time.sleep(reconnect_seconds)
-
-    logging.error("max reconnect attempts reached; exiting")
 
 
 if __name__ == "__main__":

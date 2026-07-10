@@ -6,4 +6,5 @@
 
 - `macos/` —— Python LaunchAgent（`clipboard_relay_agent`），device_id 为
   `mac-china`。已测试，正在运行中。详见 `macos/README.md`。
-- `windows/` —— 尚未实现。device_id 为 `win-fukuoka`。
+- `windows/` —— Python 脚本 + 计划任务（Task Scheduler），device_id 为
+  `win-fukuoka`。已测试，正在运行中。详见 `windows/README.md`。
