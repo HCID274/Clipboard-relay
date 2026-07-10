@@ -1,124 +1,112 @@
-# Clipboard Relay Protocol
+# 剪贴板中继协议
 
-This is the wire contract between the server (`server/`) and any agent
-(`agent/macos/`, `agent/windows/`). Any change here must be rolled out to the
-server and every agent together — they are not independently versioned.
+这是服务端（`server/`）与所有 Agent（`agent/macos/`、`agent/windows/`）之间的通信契约。
+改这份协议时，服务端和每一个 Agent 必须一起改——它们不是各自独立版本演进的。
 
-Source of truth for the actual behavior is `server/app.py`. If this doc and
-the code disagree, the code wins — fix this doc.
+以 `server/app.py` 的实际实现为准。如果本文档和代码有出入，以代码为准，并回来修这份文档。
 
-## Actors
+## 参与方
 
-- **Browser** — sends text via `POST /api/send`.
-- **Server** — single FastAPI process, holds one WebSocket per connected
-  agent in memory (no persistence, no queue).
-- **Agent** — a per-device background process that holds the `/ws/agent`
-  connection open and writes incoming text to the local clipboard.
+- **浏览器** —— 通过 `POST /api/send` 发送文本。
+- **服务端** —— 单个 FastAPI 进程，在内存里为每个已连接的 Agent 保存一条 WebSocket
+  连接（没有持久化，没有消息队列）。
+- **Agent** —— 每台设备上的一个常驻后台进程，保持 `/ws/agent` 连接，把收到的文本
+  写入本机剪贴板。
 
-## Devices
+## 设备清单
 
-Device IDs are hardcoded in `server/app.py` (`DEVICES` dict), not configurable
-via environment yet:
+`device_id` 目前硬编码在 `server/app.py` 的 `DEVICES` 字典里，还不支持通过环境变量配置：
 
-| device_id     | label          |
-|---------------|----------------|
-| `win-fukuoka` | 福冈 Windows    |
-| `mac-china`   | 中国大陆 Mac    |
+| device_id     | 说明          |
+|---------------|--------------|
+| `win-fukuoka` | 福冈 Windows  |
+| `mac-china`   | 中国大陆 Mac  |
 
-A `target`/`device_id` not in this dict is rejected everywhere it's used.
+任何用到 `target`/`device_id` 的地方，只要不在这个字典里，一律被拒绝。
 
-## Auth
+## 鉴权
 
-Every request (HTTP and WebSocket) must carry:
+所有请求（HTTP 和 WebSocket）都必须带：
 
 ```
-X-API-Key: <shared secret>
+X-API-Key: <共享密钥>
 ```
 
-The server compares it with `hmac.compare_digest()` against the `API_KEY` env
-var. There is a single shared key for all devices — no per-device keys.
+服务端用 `hmac.compare_digest()` 和环境变量 `API_KEY` 比较。所有设备共用同一把密钥，
+没有按设备区分的密钥。
 
-- If `API_KEY` is unset on the server: HTTP returns `500`, WebSocket closes
-  immediately with code `1008`.
-- If the key is present but wrong: HTTP returns `401`, WebSocket closes with
-  code `1008`.
-- **Note:** a bad `device_id` also closes with code `1008` — the close code
-  alone does not tell you whether auth or device_id failed.
+- 如果服务端 `API_KEY` 未配置：HTTP 返回 `500`，WebSocket 直接以 `1008` 关闭。
+- 如果密钥存在但不对：HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
+- **注意**：`device_id` 无效时同样以 `1008` 关闭——单看关闭码无法区分是鉴权失败
+  还是 device_id 无效。
 
-## HTTP API
+## HTTP 接口
 
 ### `GET /`
-Returns `server/static/index.html`. No auth required.
+返回 `server/static/index.html`。无需鉴权。
 
 ### `GET /health`
-Returns `{"ok": true}`. No auth required. Used for systemd/docker/nginx
-health checks.
+返回 `{"ok": true}`。无需鉴权。供 systemd/Docker/Nginx 健康检查使用。
 
 ### `POST /api/send`
 
-Headers: `X-API-Key: <key>`, `Content-Type: application/json`
+请求头：`X-API-Key: <密钥>`、`Content-Type: application/json`
 
-Body:
+请求体：
 ```json
 {"target": "win-fukuoka", "text": "..."}
 ```
 
-Responses:
+响应：
 
-| Status | Condition |
+| 状态码 | 触发条件 |
 |---|---|
-| `200 {"ok": true}` | Delivered to the connected agent |
-| `400 invalid target` | `target` missing or not in `DEVICES` |
-| `400 text is empty` | `text` missing, not a string, or all whitespace |
-| `401 invalid API key` | Key missing or wrong |
-| `500 API_KEY is not configured` | Server has no `API_KEY` set |
-| `503 target device is not connected` | No agent currently holds that `device_id`'s WebSocket |
+| `200 {"ok": true}` | 已成功推送给对应 Agent |
+| `400 invalid target` | `target` 缺失，或不在 `DEVICES` 里 |
+| `400 text is empty` | `text` 缺失、不是字符串、或全是空白字符 |
+| `401 invalid API key` | 密钥缺失或错误 |
+| `500 API_KEY is not configured` | 服务端没有设置 `API_KEY` |
+| `503 target device is not connected` | 该 `device_id` 当前没有已连接的 WebSocket |
 
-Notes:
-- `text` is only checked with `.strip()` for emptiness — the value actually
-  forwarded to the agent is the **original, unstripped** string.
-- The server never stores the text; if the agent isn't connected, the
-  message is dropped, not queued.
+注意事项：
+- 判空只用 `.strip()` 检查，但**真正转发给 Agent 的是原始、未经 strip 的文本**。
+- 服务端从不存储文本；如果目标 Agent 未连接，消息直接丢弃，不会排队等待。
 
-## WebSocket: `/ws/agent`
+## WebSocket：`/ws/agent`
 
-Connect:
+连接地址：
 ```
 wss://clip.hcid274.cn/ws/agent?device_id=<win-fukuoka|mac-china>
 ```
-Header: `X-API-Key: <shared secret>`
+请求头：`X-API-Key: <共享密钥>`
 
-Server-side validation order on connect:
-1. `X-API-Key` must match `API_KEY` → else close `1008`
-2. `device_id` query param must be a key in `DEVICES` → else close `1008`
-3. Accept the connection, store it keyed by `device_id`
+服务端连接时的校验顺序：
+1. `X-API-Key` 必须匹配 `API_KEY` —— 否则以 `1008` 关闭
+2. `device_id` 查询参数必须是 `DEVICES` 里的一个 key —— 否则以 `1008` 关闭
+3. 接受连接，按 `device_id` 存入内存
 
-**Replacement behavior:** if a new connection arrives for a `device_id` that
-already has one open, the old connection is closed with code `1000` (normal
-closure) and replaced. Only one live connection per `device_id` at a time.
+**替换行为**：如果某个 `device_id` 已有一条连接在线，新连接到达时旧连接会以
+`1000`（正常关闭）关闭并被替换。同一个 `device_id` 同一时刻只允许一条活跃连接。
 
-**Message pushed to the agent** (server → agent only; the server does not
-expect any particular message content back):
+**服务端推给 Agent 的消息**（仅服务端 → Agent 方向；服务端不关心 Agent 回传的
+内容）：
 ```json
 {"type": "clipboard", "text": "..."}
 ```
 
-**Keeping the connection alive:** the server calls `receive_text()` in a loop
-purely to detect disconnects — it ignores whatever the agent sends. Agents
-may send periodic pings/text as a heartbeat; the protocol does not depend on
-the content.
+**保持连接存活**：服务端在循环里调用 `receive_text()`，纯粹是为了侦测断开——
+它会忽略 Agent 发来的任何内容。Agent 可以定时发心跳（ping/文本），但协议本身
+不依赖心跳的具体内容。
 
-**Disconnect:** on `WebSocketDisconnect`, the server removes that `device_id`
-from its in-memory map — the target then shows as "not connected" for
-`/api/send` (`503`) until a new agent connection replaces it.
+**断线处理**：`WebSocketDisconnect` 触发后，服务端会把该 `device_id` 从内存表里
+移除——在新的 Agent 连接顶替它之前，`/api/send` 会认为该目标"未连接"（返回
+`503`）。
 
-## Constraints (current, not aspirational)
+## 当前约束（现状，不是设计目标）
 
-- Single process / single worker only. Connections live in-process memory —
-  multiple workers or replicas would let `/api/send` land on a worker with no
-  knowledge of the agent's connection. Don't scale this horizontally without
-  first moving connection state to something shared (e.g. Redis pub/sub).
-- No message queueing — an offline agent means the message is lost, not
-  delayed.
-- No rate limiting, no request body size limit.
-- No per-device API keys — one shared key for everything.
+- 只能单进程 / 单 worker。连接状态保存在进程内存里——多 worker 或多副本部署会
+  导致 `/api/send` 落到某个不知道该 Agent 连接的 worker 上。要横向扩展，必须先
+  把连接状态迁移到共享存储（例如 Redis pub/sub）。
+- 没有消息队列——目标 Agent 离线时消息直接丢失，不会延迟送达。
+- 没有限流，没有请求体大小限制。
+- 没有按设备区分的密钥——所有设备共用一把。

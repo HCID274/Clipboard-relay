@@ -1,17 +1,18 @@
-# Clipboard Relay Agent for Mac
+# Mac 剪贴板中继 Agent
 
-User-level macOS agent that connects to the Osaka Clipboard Relay WebSocket and writes received text to the current login user's clipboard.
+用户级 macOS Agent，连接大阪剪贴板中继服务的 WebSocket，把收到的文本写入当前
+登录用户的剪贴板。
 
-## Paths
+## 路径
 
-- Project: `agent/macos/` in this repo (previously a standalone project at
-  `~/Documents/Codex/01_projects/clipboard-relay-agent-mac`)
-- Config: `~/Library/Application Support/ClipboardRelay/config.json`
-- Status: `~/Library/Application Support/ClipboardRelay/status.json`
-- Log: `~/Library/Logs/ClipboardRelay/agent.log` with 1 MB rotation and 3 backups
-- LaunchAgent: `~/Library/LaunchAgents/com.clipboardrelay.agent.plist`
+- 项目位置：本仓库的 `agent/macos/`（此前是独立项目，位于
+  `~/Documents/Codex/01_projects/clipboard-relay-agent-mac`，已合并进 monorepo）
+- 配置文件：`~/Library/Application Support/ClipboardRelay/config.json`
+- 状态文件：`~/Library/Application Support/ClipboardRelay/status.json`
+- 日志：`~/Library/Logs/ClipboardRelay/agent.log`，1 MB 轮转，保留 3 份
+- LaunchAgent：`~/Library/LaunchAgents/com.clipboardrelay.agent.plist`
 
-## Setup
+## 安装配置
 
 ```bash
 cd agent/macos
@@ -20,15 +21,15 @@ mkdir -p "$HOME/Library/Application Support/ClipboardRelay"
 cp config.example.json "$HOME/Library/Application Support/ClipboardRelay/config.json"
 ```
 
-Edit `api_key` in `~/Library/Application Support/ClipboardRelay/config.json`.
+编辑 `~/Library/Application Support/ClipboardRelay/config.json` 里的 `api_key`。
 
-## Foreground Test
+## 前台测试
 
 ```bash
 ~/.local/bin/uv run python -m clipboard_relay_agent
 ```
 
-Send a route test:
+发一条路由测试：
 
 ```bash
 curl -X POST https://clip.hcid274.cn/api/send \
@@ -37,29 +38,30 @@ curl -X POST https://clip.hcid274.cn/api/send \
   -d '{"target":"mac-china","text":"mac route test"}'
 ```
 
-Check:
+检查结果：
 
 ```bash
 pbpaste
 ```
 
-## Diagnostics
+## 诊断排查
 
-Check the current LaunchAgent process:
+查看当前 LaunchAgent 进程：
 
 ```bash
 launchctl print "gui/$(id -u)/com.clipboardrelay.agent"
 ```
 
-Check the latest connection state written by the agent:
+查看 Agent 写入的最新连接状态：
 
 ```bash
 cat "$HOME/Library/Application Support/ClipboardRelay/status.json"
 ```
 
-The status file records the target `device_id`, the WebSocket URL, the latest event, the process ID, and whether the agent currently believes the WebSocket is connected.
+状态文件记录了目标 `device_id`、WebSocket 地址、最近一次事件、进程 ID，以及
+Agent 当前认为的连接状态。
 
-## Background Install
+## 后台安装
 
 ```bash
 scripts/install_launchagent.sh
@@ -67,9 +69,9 @@ launchctl list | grep clipboardrelay
 tail -n 100 "$HOME/Library/Logs/ClipboardRelay/agent.log"
 ```
 
-The LaunchAgent is installed as a background process with low-priority I/O and a 30-second launch throttle.
+LaunchAgent 会以后台进程方式安装，低 I/O 优先级，30 秒启动节流。
 
-## Uninstall
+## 卸载
 
 ```bash
 scripts/uninstall_launchagent.sh

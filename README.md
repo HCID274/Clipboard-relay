@@ -1,38 +1,40 @@
-# Clipboard Relay
+# Clipboard Relay（剪贴板中继）
 
-FastAPI relay for sending text from an Android browser page to connected desktop clipboard agents.
+一个 FastAPI 中继服务，把手机浏览器页面输入的文本发送给已连接的桌面剪贴板 Agent。
 
-## Layout
+## 目录结构
 
-- `server/` = FastAPI relay service and browser page.
-- `agent/` = cross-platform clipboard clients.
-- `docs/` = protocol contracts and deployment notes.
+- `server/` = FastAPI 中继服务和浏览器发送页面。
+- `agent/` = 各平台的剪贴板客户端。
+- `docs/` = 协议契约和部署说明。
 
-## Devices
+## 设备清单
 
 - `win-fukuoka` = 福冈 Windows
 - `mac-china` = 中国大陆 Mac
 
-## Endpoints
+完整协议细节见 [docs/protocol.md](docs/protocol.md)。
 
-- `GET /` serves the browser page.
-- `GET /health` returns `{"ok": true}`.
-- `POST /api/send` accepts `{"target":"win-fukuoka","text":"..."}` or `{"target":"mac-china","text":"..."}` with `X-API-Key`.
-- `WS /ws/agent?device_id=win-fukuoka` accepts the Windows agent connection with `X-API-Key`.
-- `WS /ws/agent?device_id=mac-china` accepts the Mac agent connection with `X-API-Key`.
+## 接口
 
-The browser page stores the user-entered API key in `localStorage` under
-`clipboardRelayApiKey`, stores the selected target under `clipboardRelayTarget`,
-and lets the user clear the key from the page. The server still requires
-`X-API-Key` for every send request.
+- `GET /` 返回浏览器发送页面。
+- `GET /health` 返回 `{"ok": true}`。
+- `POST /api/send` 接受 `{"target":"win-fukuoka","text":"..."}` 或
+  `{"target":"mac-china","text":"..."}`，需带 `X-API-Key`。
+- `WS /ws/agent?device_id=win-fukuoka` 接受 Windows Agent 的连接，需带 `X-API-Key`。
+- `WS /ws/agent?device_id=mac-china` 接受 Mac Agent 的连接，需带 `X-API-Key`。
 
-The server pushes messages to the agent in this format:
+浏览器页面把用户输入的密钥存在 `localStorage` 的 `clipboardRelayApiKey` 里，
+把选择的目标设备存在 `clipboardRelayTarget` 里，并支持在页面上清除密钥。
+无论如何，服务端每次发送请求都仍然要求 `X-API-Key`。
+
+服务端推给 Agent 的消息格式：
 
 ```json
 {"type":"clipboard","text":"..."}
 ```
 
-Run locally:
+本地运行：
 
 ```bash
 cd server
