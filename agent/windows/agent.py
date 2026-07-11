@@ -48,6 +48,7 @@ def validate_password(value: Any) -> str:
 
 
 def config_needs_password(config_path: Path) -> bool:
+    """Return whether a readable config needs a password to be supplied."""
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -60,6 +61,19 @@ def config_needs_password(config_path: Path) -> bool:
     except ValueError:
         return True
     return False
+
+
+def password_setup_status(config_path: Path) -> int:
+    """Return the installer status for password setup.
+
+    Status 0 requests a password, status 1 means that the existing password is
+    valid, and status 2 means that the config file could not be inspected.
+    """
+    try:
+        needs_password = config_needs_password(config_path)
+    except ValueError:
+        return 2
+    return 0 if needs_password else 1
 
 
 def setup_logging() -> None:

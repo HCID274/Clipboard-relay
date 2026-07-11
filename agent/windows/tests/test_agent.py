@@ -67,6 +67,28 @@ def test_config_needs_password_recognizes_placeholder_and_valid_password(tmp_pat
     assert agent.config_needs_password(config_path) is False
 
 
+@pytest.mark.parametrize(
+    ("contents", "expected_status"),
+    [
+        ('{"password": "replace-with-relay-password"}', 0),
+        ('{"password": "secret-password"}', 1),
+        ("{not valid JSON", 2),
+        ("[]", 2),
+    ],
+)
+def test_password_setup_status_distinguishes_config_errors(
+    tmp_path, contents, expected_status
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(contents, encoding="utf-8")
+
+    assert agent.password_setup_status(config_path) == expected_status
+
+    if expected_status == 2:
+        with pytest.raises(ValueError):
+            agent.config_needs_password(config_path)
+
+
 def test_registration_prompts_with_hostname_and_persists_server_identity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
