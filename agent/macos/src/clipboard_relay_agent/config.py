@@ -44,6 +44,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     server_ws_url = _required_string(raw, "server_ws_url")
     password_key = "password" if "password" in raw else "api_key"
     api_key = _required_string(raw, password_key)
+    if not api_key.isascii():
+        raise ConfigError(
+            f"Config value {password_key!r} must contain only ASCII characters"
+        )
     reconnect_seconds = _reconnect_seconds(raw.get("reconnect_seconds", DEFAULT_RECONNECT_SECONDS))
     device_id = raw.get("device_id")
     if device_id is None:

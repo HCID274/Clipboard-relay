@@ -18,6 +18,8 @@ copy config.example.json config.json
 install_task.cmd
 ```
 
+`password` 只允许使用 ASCII 字符，并且管理员应当配置足够长的随机密码或随机英文词组。
+
 安装脚本会先执行交互式注册。配置中没有 `device_id` 时，Agent 会显示从 hostname 生成的建议值，
 用户可以回车确认或输入新名称。注册成功后，最终 ID 会保存到 `config.json`，计划任务才会创建。
 已有 `device_id` 时，Agent 会直接复用该身份。旧 `api_key` 字段仍可读取，但建议迁移为

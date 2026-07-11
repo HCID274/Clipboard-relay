@@ -10,9 +10,12 @@ Clipboard Relay 使用 FastAPI 把浏览器输入的文本转发给已注册的 
 
 ```bash
 cd server
-RELAY_PASSWORD='请使用较长的可记忆短语' MAX_DEVICES=10 \
+RELAY_PASSWORD='correct-horse-battery-staple-2026' MAX_DEVICES=10 \
   uv run uvicorn app:app --host 127.0.0.1 --port 18080 --workers 1
 ```
+
+共享密码只允许使用 ASCII 字符。管理员应当使用足够长的随机密码或随机英文词组，并且客户端与
+服务端必须配置完全相同的值。
 
 服务端必须保持单 worker。默认设备文件是 `server/devices.json`，也可以通过
 `DEVICES_FILE` 指定路径。损坏文件会触发警告并按空清单启动。

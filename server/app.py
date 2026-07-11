@@ -116,10 +116,17 @@ def _write_devices(devices: dict[str, dict[str, Any]] | None = None) -> None:
 def _credential_matches(candidate: str | None) -> bool:
     if candidate is None:
         return False
-    return any(
-        configured and hmac.compare_digest(candidate, configured)
-        for configured in (PASSWORD, API_KEY)
-    )
+    for configured in (PASSWORD, API_KEY):
+        if not configured:
+            continue
+        try:
+            candidate_bytes = candidate.encode("ascii")
+            configured_bytes = configured.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        if hmac.compare_digest(candidate_bytes, configured_bytes):
+            return True
+    return False
 
 
 def check_api_key(candidate: str | None) -> None:

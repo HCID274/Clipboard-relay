@@ -56,6 +56,24 @@ def test_new_and_legacy_passwords_are_both_accepted(client: TestClient) -> None:
     assert wrong_response.status_code == 401
 
 
+def test_non_ascii_new_password_does_not_block_legacy_api_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(relay_app, "PASSWORD", "中文密码")
+
+    response = client.get("/api/devices", headers=headers(OLD_PASSWORD))
+
+    assert response.status_code == 200
+
+
+def test_non_ascii_candidate_is_rejected_without_server_error() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        relay_app.check_api_key("中文密码")
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "invalid password"
+
+
 def test_registers_normalized_device_and_persists_it(client: TestClient) -> None:
     response = client.post(
         "/api/devices/register",

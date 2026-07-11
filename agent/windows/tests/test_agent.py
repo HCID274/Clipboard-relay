@@ -24,6 +24,22 @@ def test_load_config_reuses_device_id_from_legacy_websocket_url(tmp_path) -> Non
     assert config["device_id"] == "win-fukuoka"
 
 
+def test_load_config_rejects_non_ascii_password(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "中文密码",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit):
+        agent.load_config(config_path)
+
+
 def test_registration_prompts_with_hostname_and_persists_server_identity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

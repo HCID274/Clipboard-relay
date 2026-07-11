@@ -14,6 +14,7 @@ scripts/install_launchagent.sh
 首次运行会复制 `config.example.json` 并要求用户编辑其中的 `password`。用户编辑后再次运行安装
 脚本，脚本会显示从 hostname 生成的设备名建议；用户可以回车确认或输入新名称。注册成功后，
 服务端返回的 `device_id` 会保存到配置文件，并且 LaunchAgent 才会启动。
+`password` 只允许使用 ASCII 字符，并且管理员应当配置足够长的随机密码或随机英文词组。
 
 旧配置中的 `api_key` 字段仍可读取，便于迁移；建议将该字段改名为 `password`。已有
 `device_id` 时，安装和启动会直接复用该身份，不再询问设备名。正常启动仍会向注册接口确认

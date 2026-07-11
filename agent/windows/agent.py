@@ -86,6 +86,9 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         logging.error("password missing from config")
         sys.exit(1)
     api_key = api_key.strip()
+    if not api_key.isascii():
+        logging.error("password must contain only ASCII characters")
+        sys.exit(1)
     if api_key in {"replace-with-shared-key", "replace-with-relay-password"}:
         logging.error("password still uses placeholder value")
         sys.exit(1)
