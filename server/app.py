@@ -87,6 +87,18 @@ async def send_text(
     return {"ok": True}
 
 
+@app.get("/api/status")
+async def connection_status(
+    x_api_key: str | None = Header(default=None),
+) -> dict[str, dict[str, bool]]:
+    check_api_key(x_api_key)
+    return {
+        "devices": {
+            device_id: device_id in agents.websockets for device_id in DEVICES
+        }
+    }
+
+
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket) -> None:
     api_key = websocket.headers.get("x-api-key")

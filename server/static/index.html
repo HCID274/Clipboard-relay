@@ -87,6 +87,47 @@
         font-size: 15px;
       }
 
+      .connection-status {
+        display: flex;
+        align-items: center;
+        min-height: 24px;
+        margin-top: 9px;
+        color: #5f6368;
+        font-size: 14px;
+      }
+
+      .connection-status-dot {
+        width: 8px;
+        height: 8px;
+        margin-right: 8px;
+        border-radius: 50%;
+        background: #8d9298;
+      }
+
+      .connection-status.online {
+        color: #137333;
+      }
+
+      .connection-status.online .connection-status-dot {
+        background: #137333;
+      }
+
+      .connection-status.offline {
+        color: #9a6700;
+      }
+
+      .connection-status.offline .connection-status-dot {
+        background: #c58b00;
+      }
+
+      .connection-status.error {
+        color: #b3261e;
+      }
+
+      .connection-status.error .connection-status-dot {
+        background: #b3261e;
+      }
+
       .ok {
         color: #137333;
       }
@@ -123,6 +164,10 @@
         <option value="win-fukuoka">福冈 Windows</option>
         <option value="mac-china">中国大陆 Mac</option>
       </select>
+      <div id="connectionStatus" class="connection-status" aria-live="polite">
+        <span class="connection-status-dot" aria-hidden="true"></span>
+        <span id="connectionStatusText">请输入密钥以查询设备连接状态。</span>
+      </div>
 
       <label for="text">文本</label>
       <textarea id="text" autofocus></textarea>
@@ -140,6 +185,16 @@
       const sendButton = document.querySelector("#send");
       const clearKeyButton = document.querySelector("#clearKey");
       const statusEl = document.querySelector("#status");
+      const connectionStatusEl = document.querySelector("#connectionStatus");
+      const connectionStatusTextEl = document.querySelector("#connectionStatusText");
+      const deviceNames = Object.fromEntries(
+        [...targetSelect.options].map((option) => [option.value, option.textContent]),
+      );
+      let deviceStatuses = Object.fromEntries(
+        [...targetSelect.options].map((option) => [option.value, false]),
+      );
+      const STATUS_POLL_INTERVAL_MS = 4000;
+      let latestConnectionStatusRequestId = 0;
 
       const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
       if (savedKey) {
@@ -156,15 +211,107 @@
         statusEl.className = kind || "";
       }
 
+      function updateTargetOptions() {
+        const selectedTarget = targetSelect.value;
+        let labelsChanged = false;
+        for (const option of targetSelect.options) {
+          const suffix = deviceStatuses[option.value] ? "（在线）" : "（离线）";
+          const label = `${deviceNames[option.value]}${suffix}`;
+          if (option.textContent !== label) {
+            option.textContent = label;
+            labelsChanged = true;
+          }
+        }
+
+        if (labelsChanged) {
+          const refreshedOptions = [...targetSelect.options].map((option) => {
+            const refreshedOption = option.cloneNode(true);
+            refreshedOption.selected = option.value === selectedTarget;
+            return refreshedOption;
+          });
+          targetSelect.replaceChildren(...refreshedOptions);
+          targetSelect.value = selectedTarget;
+        }
+      }
+
+      function setConnectionStatus(message, kind) {
+        connectionStatusTextEl.textContent = message;
+        connectionStatusEl.className = `connection-status${kind ? ` ${kind}` : ""}`;
+      }
+
+      async function refreshConnectionStatus() {
+        const requestId = ++latestConnectionStatusRequestId;
+        const apiKey = apiKeyInput.value.trim();
+        if (!apiKey) {
+          setConnectionStatus("请输入密钥以查询设备连接状态。", "");
+          return;
+        }
+
+        try {
+          const response = await fetch("/api/status", {
+            headers: { "X-API-Key": apiKey },
+          });
+
+          if (requestId !== latestConnectionStatusRequestId) {
+            return;
+          }
+
+          if (response.status === 401) {
+            setConnectionStatus("密钥错误。", "error");
+            return;
+          }
+          if (response.status === 500) {
+            setConnectionStatus("服务端配置错误：API_KEY 未配置。", "error");
+            return;
+          }
+          if (!response.ok) {
+            setConnectionStatus("无法连接到中继服务器。", "error");
+            return;
+          }
+
+          const payload = await response.json();
+          if (!payload.devices || typeof payload.devices !== "object") {
+            throw new Error("invalid status payload");
+          }
+
+          if (requestId !== latestConnectionStatusRequestId) {
+            return;
+          }
+
+          for (const deviceId of Object.keys(deviceStatuses)) {
+            deviceStatuses[deviceId] = payload.devices[deviceId] === true;
+          }
+          updateTargetOptions();
+
+          const target = targetSelect.value;
+          const targetName = deviceNames[target];
+          if (deviceStatuses[target]) {
+            setConnectionStatus(`${targetName}已连接。`, "online");
+          } else {
+            setConnectionStatus(`${targetName}未连接。`, "offline");
+          }
+        } catch (error) {
+          if (requestId === latestConnectionStatusRequestId) {
+            setConnectionStatus("无法连接到中继服务器。", "error");
+          }
+        }
+      }
+
       clearKeyButton.addEventListener("click", () => {
         localStorage.removeItem(API_KEY_STORAGE_KEY);
         apiKeyInput.value = "";
         apiKeyInput.focus();
         setStatus("密钥已清除。", "");
+        refreshConnectionStatus();
       });
 
       targetSelect.addEventListener("change", () => {
         localStorage.setItem(TARGET_STORAGE_KEY, targetSelect.value);
+        refreshConnectionStatus();
+      });
+
+      apiKeyInput.addEventListener("change", () => {
+        refreshConnectionStatus();
       });
 
       sendButton.addEventListener("click", async () => {
@@ -215,6 +362,10 @@
           sendButton.disabled = false;
         }
       });
+
+      updateTargetOptions();
+      refreshConnectionStatus();
+      window.setInterval(refreshConnectionStatus, STATUS_POLL_INTERVAL_MS);
     </script>
   </body>
 </html>
