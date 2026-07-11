@@ -31,11 +31,7 @@ def get_config_path() -> Path:
 
 
 def get_log_path() -> Path:
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        base = Path(appdata)
-    else:
-        base = Path.home() / "AppData" / "Roaming"
+    base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     return base / "ClipboardRelay" / "agent.log"
 
 

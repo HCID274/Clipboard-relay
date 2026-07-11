@@ -10,7 +10,7 @@ import socket
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -82,9 +82,7 @@ def build_connection_target(server_ws_url: str) -> ConnectionTarget:
     if static_ip is None:
         return ConnectionTarget(url=server_ws_url, host=None, sslopt=None)
 
-    netloc = static_ip
-    if parsed.port is not None:
-        netloc = f"{static_ip}:{parsed.port}"
+    netloc = f"{static_ip}:{parsed.port}" if parsed.port is not None else static_ip
 
     rewritten_url = urlunparse(parsed._replace(netloc=netloc))
     return ConnectionTarget(
@@ -192,12 +190,7 @@ def register_configured_device(
     if not isinstance(registered_id, str):
         raise RegistrationError("设备注册失败：服务端返回了无效响应")
     save_device_id(config_path, registered_id)
-    return Config(
-        server_ws_url=config.server_ws_url,
-        api_key=config.api_key,
-        reconnect_seconds=config.reconnect_seconds,
-        device_id=registered_id,
-    )
+    return replace(config, device_id=registered_id)
 
 
 def extract_device_id(server_ws_url: str) -> str:

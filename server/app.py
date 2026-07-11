@@ -116,13 +116,15 @@ def _write_devices(devices: dict[str, dict[str, Any]] | None = None) -> None:
 def _credential_matches(candidate: str | None) -> bool:
     if candidate is None:
         return False
-    candidate = candidate.strip()
+    try:
+        candidate_bytes = candidate.strip().encode("ascii")
+    except UnicodeEncodeError:
+        return False
     for configured in (PASSWORD, API_KEY):
         configured = configured.strip()
         if not configured:
             continue
         try:
-            candidate_bytes = candidate.encode("ascii")
             configured_bytes = configured.encode("ascii")
         except UnicodeEncodeError:
             continue

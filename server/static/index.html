@@ -278,34 +278,41 @@
         targetSelect.replaceChildren(...options);
       }
 
+      function clearDevices() {
+        devices = [];
+        updateTargetOptions();
+        deviceListEl.replaceChildren();
+      }
+
       function formatLastActive(value) {
         const date = new Date(value);
         return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
       }
 
+      function createDeviceRow(device) {
+        const row = document.createElement("div");
+        row.className = "device-row";
+
+        const details = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "device-name";
+        name.textContent = `${device.device_id} · ${device.online ? "在线" : "离线"}`;
+        const metadata = document.createElement("div");
+        metadata.className = "device-meta";
+        metadata.textContent = `最后活跃：${formatLastActive(device.last_active)}`;
+        details.append(name, metadata);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "delete-device";
+        deleteButton.dataset.deviceId = device.device_id;
+        deleteButton.textContent = "删除";
+        row.append(details, deleteButton);
+        return row;
+      }
+
       function renderDeviceList() {
-        const rows = devices.map((device) => {
-          const row = document.createElement("div");
-          row.className = "device-row";
-
-          const details = document.createElement("div");
-          const name = document.createElement("div");
-          name.className = "device-name";
-          name.textContent = `${device.device_id} · ${device.online ? "在线" : "离线"}`;
-          const metadata = document.createElement("div");
-          metadata.className = "device-meta";
-          metadata.textContent = `最后活跃：${formatLastActive(device.last_active)}`;
-          details.append(name, metadata);
-
-          const deleteButton = document.createElement("button");
-          deleteButton.type = "button";
-          deleteButton.className = "delete-device";
-          deleteButton.dataset.deviceId = device.device_id;
-          deleteButton.textContent = "删除";
-          row.append(details, deleteButton);
-          return row;
-        });
-        deviceListEl.replaceChildren(...rows);
+        deviceListEl.replaceChildren(...devices.map(createDeviceRow));
         deviceListStatusEl.textContent = devices.length ? `共 ${devices.length} 台设备。` : "当前没有已注册设备。";
       }
 
@@ -318,9 +325,7 @@
         const requestId = ++latestConnectionStatusRequestId;
         const apiKey = apiKeyInput.value.trim();
         if (!apiKey) {
-          devices = [];
-          updateTargetOptions();
-          renderDeviceList();
+          clearDevices();
           deviceListStatusEl.textContent = "请输入密码以查看已注册设备。";
           setConnectionStatus("请输入密码以查询设备连接状态。", "");
           return;
@@ -336,11 +341,9 @@
           }
 
           if (response.status === 401) {
-            devices = [];
-            updateTargetOptions();
+            clearDevices();
             setConnectionStatus("密码错误。", "error");
             deviceListStatusEl.textContent = "密码错误。";
-            deviceListEl.replaceChildren();
             return;
           }
           if (response.status === 500) {
