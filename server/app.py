@@ -179,6 +179,14 @@ class AgentConnections:
         try:
             await websocket.send_json({"type": "clipboard", "text": text})
         except Exception:
+            try:
+                await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            except Exception as close_error:
+                LOGGER.warning(
+                    "failed to close agent websocket %s after send failure: %s",
+                    device_id,
+                    close_error,
+                )
             raise RuntimeError("agent offline")
 
 
@@ -311,5 +319,12 @@ async def websocket_agent(websocket: WebSocket) -> None:
                         key: value.copy() for key, value in DEVICES.items()
                     }
                     updated_devices[device_id]["last_active"] = last_active
-                    _write_devices(updated_devices)
                     record["last_active"] = last_active
+                    try:
+                        _write_devices(updated_devices)
+                    except OSError as error:
+                        LOGGER.warning(
+                            "failed to persist last_active for device %s: %s",
+                            device_id,
+                            error,
+                        )

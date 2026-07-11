@@ -295,7 +295,7 @@ def test_last_active_changes_only_on_new_registration_and_disconnect(
     assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
 
 
-def test_send_failure_keeps_connection_for_disconnect_last_active_update(
+def test_send_failure_closes_connection_and_updates_offline_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     relay_app.DEVICES["mac-china"] = record("mac-china")
@@ -308,11 +308,13 @@ def test_send_failure_keeps_connection_for_disconnect_last_active_update(
         def __init__(self) -> None:
             self.connected = asyncio.Event()
             self.disconnected = asyncio.Event()
+            self.close_codes: list[int] = []
 
         async def accept(self) -> None:
             self.connected.set()
 
         async def close(self, code: int) -> None:
+            self.close_codes.append(code)
             self.disconnected.set()
 
         async def receive_text(self) -> str:
@@ -320,20 +322,68 @@ def test_send_failure_keeps_connection_for_disconnect_last_active_update(
             raise WebSocketDisconnect(code=1006)
 
         async def send_json(self, _payload: dict[str, str]) -> None:
-            self.disconnected.set()
             raise ConnectionError("send failed")
 
     async def send_and_disconnect() -> None:
         websocket = FailingWebSocket()
         connection_task = asyncio.create_task(relay_app.websocket_agent(websocket))
         await websocket.connected.wait()
-        with pytest.raises(RuntimeError, match="agent offline"):
-            await relay_app.agents.send_clipboard("mac-china", "hello")
-        await connection_task
+        try:
+            with pytest.raises(RuntimeError, match="agent offline"):
+                await relay_app.agents.send_clipboard("mac-china", "hello")
+            assert websocket.close_codes == [1011]
+            await connection_task
+        finally:
+            if not connection_task.done():
+                websocket.disconnected.set()
+                await connection_task
 
     asyncio.run(send_and_disconnect())
 
+    assert "mac-china" not in relay_app.agents.websockets
     assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
+
+
+def test_disconnect_write_failure_keeps_device_offline_and_updates_memory(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    monkeypatch.setattr(relay_app, "_now", lambda: "2026-07-11T01:00:00Z")
+    monkeypatch.setattr(
+        relay_app, "_write_devices", lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    class DisconnectingWebSocket:
+        headers = {"x-api-key": NEW_PASSWORD}
+        query_params = {"device_id": "mac-china"}
+
+        def __init__(self) -> None:
+            self.connected = asyncio.Event()
+            self.disconnected = asyncio.Event()
+
+        async def accept(self) -> None:
+            self.connected.set()
+
+        async def close(self, _code: int) -> None:
+            self.disconnected.set()
+
+        async def receive_text(self) -> str:
+            await self.disconnected.wait()
+            raise WebSocketDisconnect(code=1006)
+
+    async def disconnect_with_write_failure() -> None:
+        websocket = DisconnectingWebSocket()
+        connection_task = asyncio.create_task(relay_app.websocket_agent(websocket))
+        await websocket.connected.wait()
+        websocket.disconnected.set()
+        await connection_task
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(disconnect_with_write_failure())
+
+    assert "mac-china" not in relay_app.agents.websockets
+    assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
+    assert "failed to persist last_active" in caplog.text
 
 
 def test_old_disconnect_cannot_update_last_active_after_same_device_reconnect(
