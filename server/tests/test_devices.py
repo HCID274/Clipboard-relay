@@ -56,6 +56,28 @@ def test_new_and_legacy_passwords_are_both_accepted(client: TestClient) -> None:
     assert wrong_response.status_code == 401
 
 
+def test_passwords_are_trimmed_before_comparison(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(relay_app, "PASSWORD", "  new-password  ")
+    monkeypatch.setattr(relay_app, "API_KEY", "")
+
+    response = client.get("/api/devices", headers=headers("  new-password  "))
+
+    assert response.status_code == 200
+
+
+def test_whitespace_only_password_configuration_is_missing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(relay_app, "PASSWORD", "   ")
+    monkeypatch.setattr(relay_app, "API_KEY", "")
+
+    response = client.get("/api/devices", headers=headers(""))
+
+    assert response.status_code == 500
+
+
 def test_non_ascii_new_password_does_not_block_legacy_api_key(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -271,6 +293,93 @@ def test_last_active_changes_only_on_new_registration_and_disconnect(
         assert relay_app.DEVICES["mac-china"]["last_active"] == registered["last_active"]
 
     assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
+
+
+def test_send_failure_keeps_connection_for_disconnect_last_active_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    monkeypatch.setattr(relay_app, "_now", lambda: "2026-07-11T01:00:00Z")
+
+    class FailingWebSocket:
+        headers = {"x-api-key": NEW_PASSWORD}
+        query_params = {"device_id": "mac-china"}
+
+        def __init__(self) -> None:
+            self.connected = asyncio.Event()
+            self.disconnected = asyncio.Event()
+
+        async def accept(self) -> None:
+            self.connected.set()
+
+        async def close(self, code: int) -> None:
+            self.disconnected.set()
+
+        async def receive_text(self) -> str:
+            await self.disconnected.wait()
+            raise WebSocketDisconnect(code=1006)
+
+        async def send_json(self, _payload: dict[str, str]) -> None:
+            self.disconnected.set()
+            raise ConnectionError("send failed")
+
+    async def send_and_disconnect() -> None:
+        websocket = FailingWebSocket()
+        connection_task = asyncio.create_task(relay_app.websocket_agent(websocket))
+        await websocket.connected.wait()
+        with pytest.raises(RuntimeError, match="agent offline"):
+            await relay_app.agents.send_clipboard("mac-china", "hello")
+        await connection_task
+
+    asyncio.run(send_and_disconnect())
+
+    assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
+
+
+def test_old_disconnect_cannot_update_last_active_after_same_device_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    monkeypatch.setattr(relay_app, "_now", lambda: "2026-07-11T01:00:00Z")
+
+    class ReconnectingWebSocket:
+        headers = {"x-api-key": NEW_PASSWORD}
+        query_params = {"device_id": "mac-china"}
+
+        def __init__(self, yield_on_close: bool = False) -> None:
+            self.connected = asyncio.Event()
+            self.disconnected = asyncio.Event()
+            self.yield_on_close = yield_on_close
+
+        async def accept(self) -> None:
+            self.connected.set()
+
+        async def close(self, code: int) -> None:
+            self.disconnected.set()
+            if self.yield_on_close:
+                await asyncio.sleep(0)
+
+        async def receive_text(self) -> str:
+            await self.disconnected.wait()
+            raise WebSocketDisconnect(code=1000)
+
+    async def reconnect_then_disconnect() -> None:
+        old_websocket = ReconnectingWebSocket(yield_on_close=True)
+        old_task = asyncio.create_task(relay_app.websocket_agent(old_websocket))
+        await old_websocket.connected.wait()
+
+        new_websocket = ReconnectingWebSocket()
+        new_task = asyncio.create_task(relay_app.websocket_agent(new_websocket))
+        await new_websocket.connected.wait()
+        await old_task
+
+        assert relay_app.agents.websockets["mac-china"] is new_websocket
+        assert relay_app.DEVICES["mac-china"]["last_active"] == INITIAL_TIMESTAMP
+
+        new_websocket.disconnected.set()
+        await new_task
+
+    asyncio.run(reconnect_then_disconnect())
 
 
 def test_corrupted_registry_loads_as_empty_and_logs_warning(tmp_path, caplog) -> None:

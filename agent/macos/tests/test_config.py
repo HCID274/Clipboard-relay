@@ -47,6 +47,23 @@ def test_load_config_rejects_blank_password(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_load_config_trims_password(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "  secret-key  ",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.password == "secret-key"
+
+
 def test_load_config_rejects_non_ascii_password(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

@@ -116,7 +116,9 @@ def _write_devices(devices: dict[str, dict[str, Any]] | None = None) -> None:
 def _credential_matches(candidate: str | None) -> bool:
     if candidate is None:
         return False
+    candidate = candidate.strip()
     for configured in (PASSWORD, API_KEY):
+        configured = configured.strip()
         if not configured:
             continue
         try:
@@ -130,7 +132,7 @@ def _credential_matches(candidate: str | None) -> bool:
 
 
 def check_api_key(candidate: str | None) -> None:
-    if not PASSWORD and not API_KEY:
+    if not PASSWORD.strip() and not API_KEY.strip():
         raise HTTPException(status_code=500, detail="RELAY_PASSWORD or API_KEY is not configured")
     if not _credential_matches(candidate):
         raise HTTPException(status_code=401, detail="invalid password")
@@ -177,8 +179,6 @@ class AgentConnections:
         try:
             await websocket.send_json({"type": "clipboard", "text": text})
         except Exception:
-            if self.websockets.get(device_id) is websocket:
-                self.websockets.pop(device_id, None)
             raise RuntimeError("agent offline")
 
 
@@ -285,7 +285,7 @@ async def connection_status(
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket) -> None:
     api_key = websocket.headers.get("x-api-key")
-    if not (PASSWORD or API_KEY) or not _credential_matches(api_key):
+    if not (PASSWORD.strip() or API_KEY.strip()) or not _credential_matches(api_key):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     try:
@@ -302,8 +302,8 @@ async def websocket_agent(websocket: WebSocket) -> None:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        if agents.disconnect(device_id, websocket):
-            async with device_lock:
+        async with device_lock:
+            if agents.disconnect(device_id, websocket):
                 record = DEVICES.get(device_id)
                 if record is not None:
                     last_active = _now()
