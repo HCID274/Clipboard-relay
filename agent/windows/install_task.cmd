@@ -46,7 +46,14 @@ call :ensure_password
 if errorlevel 1 exit /b 1
 
 "%PYTHON%" "%AGENT%" --register-only
-if errorlevel 1 exit /b 1
+set "REGISTER_STATUS=%ERRORLEVEL%"
+if "%REGISTER_STATUS%"=="3" (
+  call :clear_password
+  if errorlevel 1 exit /b 1
+  echo The shared password was rejected by the server. It was cleared so the next run will prompt for it again.
+  exit /b 1
+)
+if not "%REGISTER_STATUS%"=="0" exit /b 1
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ProjectDir = $env:CLIPBOARD_RELAY_PROJECT_DIR; $TaskName = 'ClipboardRelayAgent'; $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $Pythonw = Join-Path $ProjectDir '.venv\Scripts\pythonw.exe'; $Agent = Join-Path $ProjectDir 'agent.py'; $Action = New-ScheduledTaskAction -Execute $Pythonw -Argument ('\"' + $Agent + '\"') -WorkingDirectory $ProjectDir; $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $User; $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited; $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0); $Task = New-ScheduledTask -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings; Register-ScheduledTask -TaskName $TaskName -InputObject $Task -Force | Out-Null"
 if errorlevel 1 exit /b 1
@@ -76,6 +83,10 @@ if "%PASSWORD_STATUS%"=="0" (
 if "%PASSWORD_STATUS%"=="2" goto :config_error
 
 exit /b 1
+
+:clear_password
+"%PYTHON%" -c "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import agent; agent.clear_password(Path(sys.argv[2]))" "%PROJECT_DIR%" "%CONFIG_PATH%"
+exit /b %ERRORLEVEL%
 
 :config_error
 echo The config file "%CONFIG_PATH%" is unreadable or invalid. Please check config.json.

@@ -21,9 +21,14 @@ STABLE_CONNECTION_SECONDS = 60
 CONNECT_TIMEOUT_SECONDS = 8
 DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
 PLACEHOLDER_PASSWORDS = {"replace-with-shared-key", "replace-with-relay-password"}
+AUTHENTICATION_FAILURE_EXIT_CODE = 3
 
 
 class RegistrationError(RuntimeError):
+    pass
+
+
+class AuthenticationError(RegistrationError):
     pass
 
 
@@ -175,6 +180,18 @@ def save_device_id(config_path: Path, device_id: str) -> None:
     temporary_path.replace(config_path)
 
 
+def clear_password(config_path: Path) -> None:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be a JSON object")
+    raw["password"] = ""
+    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(config_path)
+
+
 def register_configured_device(
     config: dict[str, Any], config_path: Path
 ) -> dict[str, Any]:
@@ -198,7 +215,8 @@ def register_configured_device(
             detail = json.loads(exc.read().decode("utf-8")).get("detail", exc.reason)
         except (json.JSONDecodeError, AttributeError):
             detail = exc.reason
-        raise RegistrationError(f"设备注册失败（HTTP {exc.code}）：{detail}") from exc
+        error_type = AuthenticationError if exc.code == 401 else RegistrationError
+        raise error_type(f"设备注册失败（HTTP {exc.code}）：{detail}") from exc
     except (OSError, URLError, json.JSONDecodeError) as exc:
         raise RegistrationError(f"设备注册失败：{exc}") from exc
 
@@ -270,6 +288,10 @@ def run(*, register_only: bool = False, config_path: Path | None = None) -> None
     config = load_config(active_config_path)
     try:
         config = register_configured_device(config, active_config_path)
+    except AuthenticationError as exc:
+        logging.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(AUTHENTICATION_FAILURE_EXIT_CODE) from exc
     except RegistrationError as exc:
         logging.error("%s", exc)
         print(str(exc), file=sys.stderr)

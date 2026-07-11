@@ -153,3 +153,50 @@ def test_registration_reports_server_error_detail(tmp_path, monkeypatch) -> None
 
     with pytest.raises(agent.RegistrationError, match="已达设备数上限"):
         agent.register_configured_device(agent.load_config(config_path), config_path)
+
+
+def test_authentication_failure_uses_a_distinct_exit_code(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "device_id": "win-office",
+            }
+        ),
+        encoding="utf-8",
+    )
+    error = HTTPError(
+        "https://clip.hcid274.cn/api/devices/register",
+        401,
+        "Unauthorized",
+        {},
+        io.BytesIO('{"detail":"invalid password"}'.encode()),
+    )
+    monkeypatch.setattr(agent, "setup_logging", lambda: None)
+    monkeypatch.setattr(agent, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    with pytest.raises(SystemExit) as exc_info:
+        agent.run(register_only=True, config_path=config_path)
+
+    assert exc_info.value.code == agent.AUTHENTICATION_FAILURE_EXIT_CODE
+
+
+def test_clear_password_makes_the_installer_prompt_on_the_next_run(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "device_id": "win-office",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    agent.clear_password(config_path)
+
+    assert agent.password_setup_status(config_path) == 0
+    assert json.loads(config_path.read_text(encoding="utf-8"))["password"] == ""
