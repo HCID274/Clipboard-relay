@@ -212,9 +212,25 @@
       }
 
       function updateTargetOptions() {
+        const selectedTarget = targetSelect.value;
+        let labelsChanged = false;
         for (const option of targetSelect.options) {
           const suffix = deviceStatuses[option.value] ? "（在线）" : "（离线）";
-          option.textContent = `${deviceNames[option.value]}${suffix}`;
+          const label = `${deviceNames[option.value]}${suffix}`;
+          if (option.textContent !== label) {
+            option.textContent = label;
+            labelsChanged = true;
+          }
+        }
+
+        if (labelsChanged) {
+          const refreshedOptions = [...targetSelect.options].map((option) => {
+            const refreshedOption = option.cloneNode(true);
+            refreshedOption.selected = option.value === selectedTarget;
+            return refreshedOption;
+          });
+          targetSelect.replaceChildren(...refreshedOptions);
+          targetSelect.value = selectedTarget;
         }
       }
 
