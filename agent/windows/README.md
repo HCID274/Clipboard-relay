@@ -1,65 +1,34 @@
 # Windows 剪贴板中继 Agent
 
-Windows 用户会话下的剪贴板中继 Agent，连接
-`wss://clip.hcid274.cn/ws/agent?device_id=win-fukuoka`。
+该 Agent 在 Windows 用户会话中运行，并通过计划任务保持自启动。日志位于
+`%APPDATA%\ClipboardRelay\agent.log`，日志只记录文本长度，不记录剪贴板正文或密码。
 
-## 安装配置
+## 安装与注册
 
 ```cmd
+cd agent\windows
 uv venv .venv
 uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 copy config.example.json config.json
 ```
 
-编辑 `config.json`，把 `api_key` 换成共享密钥。
-
-连接稳定运行满 60 秒（`STABLE_CONNECTION_SECONDS`）后会重置重连计数；断线后按
-`reconnect_seconds` 的间隔无限重试，不会因为反复短暂断线而放弃退出。
-
-## 前台测试
-
-```cmd
-.venv\Scripts\python.exe agent.py
-```
-
-预期日志输出：
-
-```text
-connected to wss://clip.hcid274.cn/ws/agent?device_id=win-fukuoka
-```
-
-发一条测试消息：
-
-```cmd
-curl -X POST https://clip.hcid274.cn/api/send ^
-  -H "Content-Type: application/json" ^
-  -H "X-API-Key: shared-key" ^
-  -d "{\"target\":\"win-fukuoka\",\"text\":\"hello clipboard relay\"}"
-```
-
-然后在 Windows 上粘贴，确认剪贴板内容是 `hello clipboard relay`。
-
-## 后台自启动
+请先把 `config.json` 中的 `password` 改为服务端共享密码，然后运行：
 
 ```cmd
 install_task.cmd
+```
+
+安装脚本会先执行交互式注册。配置中没有 `device_id` 时，Agent 会显示从 hostname 生成的建议值，
+用户可以回车确认或输入新名称。注册成功后，最终 ID 会保存到 `config.json`，计划任务才会创建。
+已有 `device_id` 时，Agent 会直接复用该身份。旧 `api_key` 字段仍可读取，但建议迁移为
+`password`。密码错误、设备数达到上限和网络错误会显示明确提示。
+
+## 前台测试与后台管理
+
+```cmd
+.venv\Scripts\python.exe agent.py --register-only
+.venv\Scripts\python.exe agent.py
 schtasks /Query /TN "ClipboardRelayAgent"
 ```
 
-该计划任务会在当前用户登录时启动 `.venv\Scripts\pythonw.exe agent.py`。
-
-卸载：
-
-```cmd
-uninstall_task.cmd
-```
-
-## 日志
-
-日志写入：
-
-```text
-%APPDATA%\ClipboardRelay\agent.log
-```
-
-日志只记录文本长度，不记录剪贴板内容。
+连接稳定运行满 60 秒后，Agent 会重置重连计数。卸载命令是 `uninstall_task.cmd`。

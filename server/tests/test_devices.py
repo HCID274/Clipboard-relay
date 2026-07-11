@@ -1,0 +1,321 @@
+import asyncio
+import json
+
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+import pytest
+
+import app as relay_app
+
+
+NEW_PASSWORD = "new-password"
+OLD_PASSWORD = "old-api-key"
+INITIAL_TIMESTAMP = "2026-07-11T00:00:00Z"
+
+
+def record(device_id: str, timestamp: str = INITIAL_TIMESTAMP) -> dict[str, str]:
+    return {
+        "device_id": device_id,
+        "created_at": timestamp,
+        "last_active": timestamp,
+    }
+
+
+@pytest.fixture(autouse=True)
+def reset_server_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(relay_app, "PASSWORD", NEW_PASSWORD)
+    monkeypatch.setattr(relay_app, "API_KEY", OLD_PASSWORD)
+    monkeypatch.setattr(relay_app, "MAX_DEVICES", 10)
+    monkeypatch.setattr(relay_app, "DEVICES_FILE", tmp_path / "devices.json")
+    monkeypatch.setattr(relay_app, "device_lock", asyncio.Lock())
+    relay_app.DEVICES.clear()
+    relay_app.agents.websockets.clear()
+    yield
+    relay_app.DEVICES.clear()
+    relay_app.agents.websockets.clear()
+
+
+@pytest.fixture
+def client() -> TestClient:
+    with TestClient(relay_app.app) as test_client:
+        yield test_client
+
+
+def headers(password: str = NEW_PASSWORD) -> dict[str, str]:
+    return {"X-API-Key": password}
+
+
+def test_new_and_legacy_passwords_are_both_accepted(client: TestClient) -> None:
+    new_response = client.get("/api/devices", headers=headers())
+    old_response = client.get("/api/devices", headers=headers(OLD_PASSWORD))
+    wrong_response = client.get("/api/devices", headers=headers("wrong"))
+
+    assert new_response.status_code == 200
+    assert old_response.status_code == 200
+    assert wrong_response.status_code == 401
+
+
+def test_registers_normalized_device_and_persists_it(client: TestClient) -> None:
+    response = client.post(
+        "/api/devices/register",
+        headers=headers(),
+        json={"device_id": "New-Laptop"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["device_id"] == "new-laptop"
+    stored = json.loads(relay_app.DEVICES_FILE.read_text(encoding="utf-8"))
+    assert stored["devices"] == [response.json()]
+
+
+def test_registering_existing_device_returns_record_without_adding_or_rewriting(
+    client: TestClient,
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+
+    first_response = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": "MAC-CHINA"}
+    )
+    second_response = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": "mac-china"}
+    )
+
+    assert first_response.status_code == 200
+    assert first_response.json() == record("mac-china")
+    assert second_response.json() == first_response.json()
+    assert list(relay_app.DEVICES) == ["mac-china"]
+    assert not relay_app.DEVICES_FILE.exists()
+
+
+@pytest.mark.parametrize(
+    "device_id",
+    ["ab", "a" * 33, "has space", "under_score", "中文设备", None, 123],
+)
+def test_registration_rejects_invalid_device_id(client: TestClient, device_id) -> None:
+    response = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": device_id}
+    )
+
+    assert response.status_code == 400
+
+
+def test_device_limit_rejects_new_device_but_allows_existing_device(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    monkeypatch.setattr(relay_app, "MAX_DEVICES", 1)
+
+    existing_response = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": "mac-china"}
+    )
+    new_response = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": "new-device"}
+    )
+
+    assert existing_response.status_code == 200
+    assert new_response.status_code == 403
+    assert new_response.json() == {"detail": "已达设备数上限"}
+
+
+def test_concurrent_registration_cannot_exceed_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(relay_app, "MAX_DEVICES", 1)
+
+    async def register_both():
+        return await asyncio.gather(
+            relay_app.register_device({"device_id": "device-one"}, NEW_PASSWORD),
+            relay_app.register_device({"device_id": "device-two"}, NEW_PASSWORD),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(register_both())
+
+    successes = [result for result in results if isinstance(result, dict)]
+    failures = [result for result in results if isinstance(result, HTTPException)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].status_code == 403
+    assert len(relay_app.DEVICES) == 1
+
+
+def test_list_merges_persistent_records_with_online_state(client: TestClient) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+
+    with client.websocket_connect(
+        "/ws/agent?device_id=mac-china", headers=headers()
+    ):
+        response = client.get("/api/devices", headers=headers())
+
+        assert response.json() == [{**record("mac-china"), "online": True}]
+
+
+def test_websocket_rejects_unregistered_device(client: TestClient) -> None:
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            "/ws/agent?device_id=unknown-device", headers=headers()
+        ):
+            pass
+
+    assert exc_info.value.code == 1008
+
+
+def test_delete_cannot_race_between_websocket_registration_check_and_connect() -> None:
+    relay_app.DEVICES["race-device"] = record("race-device")
+    accept_started = asyncio.Event()
+    allow_accept = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    class PausedWebSocket:
+        headers = {"x-api-key": NEW_PASSWORD}
+        query_params = {"device_id": "race-device"}
+
+        async def accept(self) -> None:
+            accept_started.set()
+            await allow_accept.wait()
+
+        async def close(self, code: int) -> None:
+            disconnected.set()
+
+        async def receive_text(self) -> str:
+            await disconnected.wait()
+            raise WebSocketDisconnect(code=1000)
+
+    async def connect_and_delete() -> None:
+        websocket = PausedWebSocket()
+        connection_task = asyncio.create_task(relay_app.websocket_agent(websocket))
+        await accept_started.wait()
+        deletion_task = asyncio.create_task(
+            relay_app.delete_device("race-device", NEW_PASSWORD)
+        )
+        await asyncio.sleep(0)
+        assert not deletion_task.done()
+        allow_accept.set()
+        await deletion_task
+        await connection_task
+
+    asyncio.run(connect_and_delete())
+
+    assert "race-device" not in relay_app.DEVICES
+    assert "race-device" not in relay_app.agents.websockets
+
+
+def test_delete_closes_online_device_and_removes_record(client: TestClient) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+
+    with client.websocket_connect(
+        "/ws/agent?device_id=mac-china", headers=headers()
+    ) as websocket:
+        response = client.delete("/api/devices/mac-china", headers=headers())
+
+        assert response.status_code == 200
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            websocket.receive_text()
+        assert exc_info.value.code == 1000
+
+    assert "mac-china" not in relay_app.DEVICES
+    assert "mac-china" not in relay_app.agents.websockets
+
+
+def test_delete_missing_device_returns_404(client: TestClient) -> None:
+    response = client.delete("/api/devices/missing-device", headers=headers())
+
+    assert response.status_code == 404
+
+
+def test_deleting_last_device_persists_empty_registry(client: TestClient) -> None:
+    relay_app.DEVICES["last-device"] = record("last-device")
+
+    response = client.delete("/api/devices/last-device", headers=headers())
+
+    assert response.status_code == 200
+    stored = json.loads(relay_app.DEVICES_FILE.read_text(encoding="utf-8"))
+    assert stored == {"devices": []}
+
+
+def test_last_active_changes_only_on_new_registration_and_disconnect(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timestamps = iter(["2026-07-11T01:00:00Z", "2026-07-11T02:00:00Z"])
+    monkeypatch.setattr(relay_app, "_now", lambda: next(timestamps))
+
+    registered = client.post(
+        "/api/devices/register", headers=headers(), json={"device_id": "mac-china"}
+    ).json()
+    client.get("/api/devices", headers=headers())
+    client.get("/api/status", headers=headers())
+
+    assert registered["last_active"] == "2026-07-11T01:00:00Z"
+    with client.websocket_connect(
+        "/ws/agent?device_id=mac-china", headers=headers()
+    ):
+        assert relay_app.DEVICES["mac-china"]["last_active"] == registered["last_active"]
+
+    assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
+
+
+def test_corrupted_registry_loads_as_empty_and_logs_warning(tmp_path, caplog) -> None:
+    path = tmp_path / "devices.json"
+    path.write_text("not-json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        loaded = relay_app._load_devices(path)
+
+    assert loaded == {}
+    assert "starting empty" in caplog.text
+
+
+def test_registry_records_survive_reload(tmp_path) -> None:
+    path = tmp_path / "devices.json"
+    expected = record("persisted-device")
+    path.write_text(json.dumps({"devices": [expected]}), encoding="utf-8")
+
+    loaded = relay_app._load_devices(path)
+
+    assert loaded == {"persisted-device": expected}
+
+
+def test_missing_registry_is_created_with_initial_devices(tmp_path) -> None:
+    path = tmp_path / "devices.json"
+
+    loaded = relay_app._load_or_create_devices(path)
+
+    assert loaded == relay_app.INITIAL_DEVICES
+    assert loaded is not relay_app.INITIAL_DEVICES
+    assert all(
+        loaded[device_id] is not relay_app.INITIAL_DEVICES[device_id]
+        for device_id in loaded
+    )
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "devices": [loaded["mac-china"], loaded["win-fukuoka"]]
+    }
+
+
+def test_registration_write_failure_does_not_change_in_memory_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        relay_app, "_write_devices", lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(
+            relay_app.register_device({"device_id": "new-device"}, NEW_PASSWORD)
+        )
+
+    assert relay_app.DEVICES == {}
+
+
+def test_deletion_write_failure_keeps_device_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay_app.DEVICES["kept-device"] = record("kept-device")
+    monkeypatch.setattr(
+        relay_app, "_write_devices", lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(relay_app.delete_device("kept-device", NEW_PASSWORD))
+
+    assert relay_app.DEVICES == {"kept-device": record("kept-device")}

@@ -1,47 +1,38 @@
 # Clipboard Relay（剪贴板中继）
 
-一个 FastAPI 中继服务，把手机浏览器页面输入的文本发送给已连接的桌面剪贴板 Agent。
+Clipboard Relay 使用 FastAPI 把浏览器输入的文本转发给已注册的 macOS 或 Windows
+剪贴板 Agent。设备可以通过安装脚本自助注册，服务端会把设备清单持久化到 JSON 文件。
 
-## 目录结构
+## 服务端
 
-- `server/` = FastAPI 中继服务和浏览器发送页面。
-- `agent/` = 各平台的剪贴板客户端。
-- `docs/` = 协议契约和部署说明。
-
-## 设备清单
-
-- `win-fukuoka` = 福冈 Windows
-- `mac-china` = 中国大陆 Mac
-
-完整协议细节见 [docs/protocol.md](docs/protocol.md)。
-
-## 接口
-
-- `GET /` 返回浏览器发送页面。
-- `GET /health` 返回 `{"ok": true}`。
-- `POST /api/send` 接受 `{"target":"win-fukuoka","text":"..."}` 或
-  `{"target":"mac-china","text":"..."}`，需带 `X-API-Key`。
-- `GET /api/status` 返回全部设备当前的在线布尔状态，需带 `X-API-Key`。
-- `WS /ws/agent?device_id=win-fukuoka` 接受 Windows Agent 的连接，需带 `X-API-Key`。
-- `WS /ws/agent?device_id=mac-china` 接受 Mac Agent 的连接，需带 `X-API-Key`。
-
-浏览器页面把用户输入的密钥存在 `localStorage` 的 `clipboardRelayApiKey` 里，
-把选择的目标设备存在 `clipboardRelayTarget` 里，并支持在页面上清除密钥。
-无论如何，服务端每次发送请求都仍然要求 `X-API-Key`。
-
-浏览器页面会在密钥非空时查询并约每四秒轮询 `/api/status`，从而在目标设备下方独立展示
-连接状态。页面会区分已连接、客户端未连接、密钥错误、服务端未配置 `API_KEY` 和中继服务器
-不可达；设备下拉框通过“（在线）”或“（离线）”文字后缀标注每台设备的状态，不使用颜色区分选项。
-
-服务端推给 Agent 的消息格式：
-
-```json
-{"type":"clipboard","text":"..."}
-```
-
-本地运行：
+服务端使用 `RELAY_PASSWORD` 作为共享密码，并继续通过 `X-API-Key` 请求头传输。迁移期间可以
+同时保留旧 `API_KEY`；任一凭据都有效。两台旧设备切换完成后，请删除 `API_KEY` 并重启服务。
 
 ```bash
 cd server
-uv run uvicorn app:app --host 127.0.0.1 --port 18080 --workers 1
+RELAY_PASSWORD='请使用较长的可记忆短语' MAX_DEVICES=10 \
+  uv run uvicorn app:app --host 127.0.0.1 --port 18080 --workers 1
 ```
+
+服务端必须保持单 worker。默认设备文件是 `server/devices.json`，也可以通过
+`DEVICES_FILE` 指定路径。损坏文件会触发警告并按空清单启动。
+
+## 接口
+
+- `POST /api/devices/register` 注册或确认设备。
+- `GET /api/devices` 返回设备记录和在线状态。
+- `DELETE /api/devices/{device_id}` 删除设备并关闭其在线连接。
+- `POST /api/send` 向在线设备发送文本。
+- `GET /api/status` 返回兼容格式的在线状态。
+- `WS /ws/agent?device_id=...` 接受已注册 Agent 的连接。
+
+浏览器页面会把密码存入 `localStorage`，并在每个 API 请求中重新发送密码。页面可以动态选择、
+查看和删除设备。删除设备只会清理清单和断开当前连接；持有共享密码的设备仍然可以重新注册。
+
+## Agent 安装
+
+请进入 `agent/macos/` 或 `agent/windows/` 并按照对应 README 运行安装脚本。首次安装会读取
+hostname 作为设备名建议，用户可以确认或修改；注册成功后，最终 `device_id` 会写入本地配置，
+以后启动会直接复用。
+
+完整协议和错误码说明位于 [docs/protocol.md](docs/protocol.md)。

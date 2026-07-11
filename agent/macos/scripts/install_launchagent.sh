@@ -18,17 +18,18 @@ mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   cp "$PROJECT_DIR/config.example.json" "$CONFIG_PATH"
-  echo "Created $CONFIG_PATH. Edit api_key before starting the LaunchAgent." >&2
+  echo "Created $CONFIG_PATH. Edit password before starting the LaunchAgent." >&2
   exit 1
 fi
 
-if grep -q "replace-with-existing-shared-key" "$CONFIG_PATH"; then
-  echo "Edit api_key in $CONFIG_PATH before starting the LaunchAgent." >&2
+if grep -Eq "replace-with-(relay-password|existing-shared-key)" "$CONFIG_PATH"; then
+  echo "Edit password in $CONFIG_PATH before starting the LaunchAgent." >&2
   exit 1
 fi
 
 "$UV_BIN" python install 3.12
 "$UV_BIN" sync --frozen --project "$PROJECT_DIR"
+"$PROJECT_DIR/.venv/bin/python" -m clipboard_relay_agent --config "$CONFIG_PATH" --register-only
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

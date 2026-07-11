@@ -8,6 +8,9 @@ from clipboard_relay_agent.agent import (
     build_headers,
     configure_logging,
     handle_message,
+    register_configured_device,
+    registration_url,
+    send_registration_request,
     run_agent,
 )
 from clipboard_relay_agent.config import Config
@@ -15,6 +18,116 @@ from clipboard_relay_agent.config import Config
 
 def test_build_headers_uses_existing_api_key_header() -> None:
     assert build_headers("secret-key") == ["X-API-Key: secret-key"]
+
+
+def test_registration_url_is_derived_from_websocket_url() -> None:
+    assert registration_url("wss://clip.hcid274.cn/ws/agent?device_id=old") == (
+        "https://clip.hcid274.cn/api/devices/register"
+    )
+
+
+def test_registration_prompts_from_hostname_and_persists_server_device_id(
+    monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "secret-key",
+            }
+        ),
+        encoding="utf-8",
+    )
+    requests = []
+
+    def send_request(server_ws_url, password, device_id):
+        requests.append((server_ws_url, password, device_id))
+        return {"device_id": "my-mac"}
+
+    monkeypatch.setattr(agent_module, "send_registration_request", send_request)
+    config = register_configured_device(
+        Config("wss://clip.hcid274.cn/ws/agent", "secret-key"),
+        config_path,
+        prompt=lambda message: "" if "my-mac" in message else "unexpected",
+        hostname="My Mac.local",
+    )
+
+    assert config.device_id == "my-mac"
+    assert json.loads(config_path.read_text(encoding="utf-8"))["device_id"] == "my-mac"
+    assert requests == [
+        ("wss://clip.hcid274.cn/ws/agent", "secret-key", "my-mac-local")
+    ]
+
+
+def test_registration_reuses_saved_device_id_without_prompt(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "secret-key",
+                "device_id": "saved-mac",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "send_registration_request",
+        lambda *_args: {"device_id": "saved-mac"},
+    )
+
+    config = register_configured_device(
+        Config(
+            "wss://clip.hcid274.cn/ws/agent",
+            "secret-key",
+            device_id="saved-mac",
+        ),
+        config_path,
+        prompt=lambda _message: (_ for _ in ()).throw(AssertionError("prompted")),
+    )
+
+    assert config.device_id == "saved-mac"
+
+
+def test_registration_uses_static_ip_with_original_http_host_and_tls_name(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class Response:
+        status = 200
+        reason = "OK"
+
+        def read(self):
+            return b'{"device_id":"mac-china"}'
+
+    class Connection:
+        def __init__(self, connect_host, tls_host, port, timeout):
+            calls.append(("connect", connect_host, tls_host, port, timeout))
+
+        def request(self, method, path, body, headers):
+            calls.append(("request", method, path, json.loads(body), headers))
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(agent_module, "StaticAddressHTTPSConnection", Connection)
+
+    payload = send_registration_request(
+        "wss://clip.hcid274.cn/ws/agent", "secret-key", "mac-china"
+    )
+
+    assert payload == {"device_id": "mac-china"}
+    assert calls[0] == ("connect", "64.176.40.67", "clip.hcid274.cn", 443, 8)
+    assert calls[1][0:3] == ("request", "POST", "/api/devices/register")
+    assert calls[1][3] == {"device_id": "mac-china"}
+    assert calls[1][4]["X-API-Key"] == "secret-key"
 
 
 def test_build_connection_target_uses_static_ip_with_original_host_and_sni() -> None:
@@ -179,7 +292,7 @@ def test_configure_logging_uses_single_bounded_file_handler(tmp_path) -> None:
             handler.close()
 
 
-def test_run_agent_passes_raw_websocket_messages_to_handler(monkeypatch) -> None:
+def test_run_agent_passes_raw_websocket_messages_to_handler(monkeypatch, tmp_path) -> None:
     handled = []
 
     class MessageWebSocketApp:
@@ -192,6 +305,7 @@ def test_run_agent_passes_raw_websocket_messages_to_handler(monkeypatch) -> None
 
     monkeypatch.setattr(agent_module.websocket, "WebSocketApp", MessageWebSocketApp)
     monkeypatch.setattr(agent_module, "handle_message", lambda msg, **_kwargs: handled.append(msg))
+    monkeypatch.setattr(agent_module, "STATUS_PATH", tmp_path / "status.json")
 
     run_agent(
         Config(

@@ -6,6 +6,9 @@
 __pycache__/
 *.pyc
 
+# Server runtime state
+/server/devices.json
+
 # Windows Agent local runtime state
 /agent/windows/config.json
 /agent/windows/.venv/
