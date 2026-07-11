@@ -3,7 +3,7 @@ name = "clipboard-relay"
 version = "0.1.0"
 description = "Small FastAPI relay for sending browser text to a connected Windows clipboard agent."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0",
     "python-dotenv>=1.0.1",
