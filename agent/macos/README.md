@@ -6,14 +6,20 @@
 
 ## 安装与注册
 
+在 Finder 中双击 `一键安装.command` 即可完成安装。该入口会打开终端，首次安装时会隐藏回显地要求输入
+服务端共享密码，然后自动安装依赖、注册设备并安装 LaunchAgent。
+
+也可以在终端中运行：
+
 ```bash
 cd agent/macos
 scripts/install_launchagent.sh
 ```
 
-首次运行会复制 `config.example.json` 并要求用户编辑其中的 `password`。用户编辑后再次运行安装
-脚本，脚本会显示从 hostname 生成的设备名建议；用户可以回车确认或输入新名称。注册成功后，
-服务端返回的 `device_id` 会保存到配置文件，并且 LaunchAgent 才会启动。
+首次运行会自动复制 `config.example.json`，并且安装脚本会隐藏回显地要求输入 `password`，因此用户
+不需要手动编辑任何配置文件。密码已填写且有效时，脚本会跳过密码提示，因而可以安全地重复运行。
+脚本会显示从 hostname 生成的设备名建议；用户可以回车确认或输入新名称。注册成功后，服务端返回的
+`device_id` 会保存到配置文件，并且 LaunchAgent 才会启动。
 `password` 只允许使用 ASCII 字符，并且管理员应当配置足够长的随机密码或随机英文词组。
 
 旧配置中的 `api_key` 字段仍可读取，便于迁移；建议将该字段改名为 `password`。已有

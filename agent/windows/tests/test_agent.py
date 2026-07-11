@@ -40,6 +40,33 @@ def test_load_config_rejects_non_ascii_password(tmp_path) -> None:
         agent.load_config(config_path)
 
 
+def test_config_needs_password_recognizes_placeholder_and_valid_password(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "replace-with-relay-password",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert agent.config_needs_password(config_path) is True
+
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "secret-password",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert agent.config_needs_password(config_path) is False
+
+
 def test_registration_prompts_with_hostname_and_persists_server_identity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

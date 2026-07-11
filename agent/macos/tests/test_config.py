@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from clipboard_relay_agent.config import ConfigError, load_config, save_device_id
+from clipboard_relay_agent.config import (
+    ConfigError,
+    config_needs_password,
+    load_config,
+    save_device_id,
+    set_password,
+)
 
 
 def test_load_config_reads_required_values_and_default_reconnect(tmp_path: Path) -> None:
@@ -78,6 +84,44 @@ def test_load_config_rejects_non_ascii_password(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="ASCII"):
         load_config(config_path)
+
+
+def test_load_config_rejects_placeholder_password(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "replace-with-relay-password",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="placeholder"):
+        load_config(config_path)
+
+
+def test_password_setup_replaces_placeholder_and_preserves_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "replace-with-relay-password",
+                "reconnect_seconds": 7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert config_needs_password(config_path) is True
+    set_password(config_path, "new-secret")
+
+    assert config_needs_password(config_path) is False
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["password"] == "new-secret"
+    assert saved["reconnect_seconds"] == 7
 
 
 def test_save_device_id_preserves_config_and_persists_normalized_identity(tmp_path: Path) -> None:

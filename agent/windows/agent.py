@@ -20,6 +20,7 @@ TASK_NAME = "ClipboardRelayAgent"
 STABLE_CONNECTION_SECONDS = 60
 CONNECT_TIMEOUT_SECONDS = 8
 DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
+PLACEHOLDER_PASSWORDS = {"replace-with-shared-key", "replace-with-relay-password"}
 
 
 class RegistrationError(RuntimeError):
@@ -33,6 +34,32 @@ def get_config_path() -> Path:
 def get_log_path() -> Path:
     base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     return base / "ClipboardRelay" / "agent.log"
+
+
+def validate_password(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("password missing from config")
+    password = value.strip()
+    if not password.isascii():
+        raise ValueError("password must contain only ASCII characters")
+    if password in PLACEHOLDER_PASSWORDS:
+        raise ValueError("password still uses placeholder value")
+    return password
+
+
+def config_needs_password(config_path: Path) -> bool:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read config file: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("config root must be a JSON object")
+
+    try:
+        validate_password(config.get("password", config.get("api_key")))
+    except ValueError:
+        return True
+    return False
 
 
 def setup_logging() -> None:
@@ -77,16 +104,10 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         logging.error("server_ws_url must be a ws:// or wss:// URL")
         sys.exit(1)
 
-    api_key = config.get("password", config.get("api_key"))
-    if not isinstance(api_key, str) or not api_key.strip():
-        logging.error("password missing from config")
-        sys.exit(1)
-    api_key = api_key.strip()
-    if not api_key.isascii():
-        logging.error("password must contain only ASCII characters")
-        sys.exit(1)
-    if api_key in {"replace-with-shared-key", "replace-with-relay-password"}:
-        logging.error("password still uses placeholder value")
+    try:
+        api_key = validate_password(config.get("password", config.get("api_key")))
+    except ValueError as exc:
+        logging.error("%s", exc)
         sys.exit(1)
 
     device_id = config.get("device_id")

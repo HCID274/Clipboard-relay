@@ -11,6 +11,9 @@ DEFAULT_CONFIG_PATH = (
     Path.home() / "Library" / "Application Support" / "ClipboardRelay" / "config.json"
 )
 DEFAULT_RECONNECT_SECONDS = 5
+PLACEHOLDER_PASSWORDS = frozenset(
+    {"replace-with-shared-key", "replace-with-relay-password"}
+)
 
 
 class ConfigError(RuntimeError):
@@ -43,11 +46,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
 
     server_ws_url = _required_string(raw, "server_ws_url")
     password_key = "password" if "password" in raw else "api_key"
-    api_key = _required_string(raw, password_key).strip()
-    if not api_key.isascii():
-        raise ConfigError(
-            f"Config value {password_key!r} must contain only ASCII characters"
-        )
+    api_key = validate_password(raw.get(password_key), password_key)
     reconnect_seconds = _reconnect_seconds(raw.get("reconnect_seconds", DEFAULT_RECONNECT_SECONDS))
     device_id = raw.get("device_id")
     if device_id is None:
@@ -65,14 +64,50 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     )
 
 
+def config_needs_password(path: Path) -> bool:
+    """Return whether a readable config needs a password to be supplied."""
+    raw = _load_raw_config(path)
+    password_key = "password" if "password" in raw else "api_key"
+    try:
+        validate_password(raw.get(password_key), password_key)
+    except ConfigError:
+        return True
+    return False
+
+
+def set_password(path: Path, password: str) -> None:
+    """Validate and persist a password without changing the other config values."""
+    raw = _load_raw_config(path)
+    raw["password"] = validate_password(password)
+    _write_config(path, raw)
+
+
+def validate_password(value: Any, key: str = "password") -> str:
+    password = _required_string({key: value}, key).strip()
+    if not password.isascii():
+        raise ConfigError(f"Config value {key!r} must contain only ASCII characters")
+    if password in PLACEHOLDER_PASSWORDS:
+        raise ConfigError(f"Config value {key!r} still uses a placeholder value")
+    return password
+
+
 def save_device_id(path: Path, device_id: str) -> None:
+    raw = _load_raw_config(path)
+    raw["device_id"] = device_id
+    _write_config(path, raw)
+
+
+def _load_raw_config(path: Path) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Cannot update config file: {path}") from exc
     if not isinstance(raw, dict):
         raise ConfigError("Config root must be a JSON object")
-    raw["device_id"] = device_id
+    return raw
+
+
+def _write_config(path: Path, raw: dict[str, Any]) -> None:
     temporary_path = path.with_name(f".{path.name}.tmp")
     try:
         temporary_path.write_text(
