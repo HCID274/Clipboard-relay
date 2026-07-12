@@ -24,6 +24,33 @@ install_task.cmd
 已有 `device_id` 时，Agent 会直接复用该身份。旧 `api_key` 字段仍可读取，但建议迁移为
 `password`。密码错误、设备数达到上限和网络错误会显示明确提示。
 
+## 单元测试（务必在本目录执行）
+
+测试文件通过 `import agent` 加载 **`agent/windows/agent.py` 这个单文件模块**。
+因此必须先 `cd` 到 `agent\windows`，再运行 pytest。不要从仓库根目录执行
+`pytest agent/windows/tests`：那样会把仓库里的 `agent/` 目录当成 Python 包导入，
+导致全部测试以 `AttributeError` 失败（找不到 `load_config` 等函数）。
+
+正确写法：
+
+```cmd
+cd agent\windows
+.venv\Scripts\python.exe -m pytest -q
+```
+
+若本机没有 `.venv`，可用任意已安装 `pytest` / `websocket-client` / `pyperclip` 的 Python：
+
+```cmd
+cd agent\windows
+python -m pytest -q
+```
+
+错误写法（从仓库根执行，会导错模块）：
+
+```cmd
+python -m pytest agent/windows/tests -q
+```
+
 ## 前台测试与后台管理
 
 ```cmd

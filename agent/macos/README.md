@@ -26,6 +26,15 @@ scripts/install_launchagent.sh
 `device_id` 时，安装和启动会直接复用该身份，不再询问设备名。正常启动仍会向注册接口确认
 该设备存在，密码错误、设备数达到上限或网络失败都会显示明确错误并阻止后台安装。
 
+## 单元测试
+
+在本目录执行（不要从仓库根乱指路径）：
+
+```bash
+cd agent/macos
+uv run pytest -q
+```
+
 ## 前台测试与诊断
 
 ```bash
