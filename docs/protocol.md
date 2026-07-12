@@ -1,135 +1,115 @@
 # 剪贴板中继协议
 
-这是服务端（`server/`）与所有 Agent（`agent/macos/`、`agent/windows/`）之间的通信契约。
-改这份协议时，服务端和每一个 Agent 必须一起改——它们不是各自独立版本演进的。
+服务端、浏览器和 macOS/Windows Agent 共同遵守本协议。服务端固定使用单进程、单 worker，
+因为 WebSocket 在线状态和设备文件写锁都位于进程内存中。
 
-以 `server/app.py` 的实际实现为准。如果本文档和代码有出入，以代码为准，并回来修这份文档。
+## 鉴权与配置
 
-## 参与方
+所有受保护的 HTTP 请求和 WebSocket 连接都携带 `X-API-Key: <共享密码>`。服务端使用
+`hmac.compare_digest()` 比较凭据，密码不会出现在 URL 中。生产环境必须使用 HTTPS/WSS，
+而且日志不得记录密码。
 
-- **浏览器** —— 通过 `POST /api/send` 发送文本。
-- **服务端** —— 单个 FastAPI 进程，在内存里为每个已连接的 Agent 保存一条 WebSocket
-  连接（没有持久化，没有消息队列）。
-- **Agent** —— 每台设备上的一个常驻后台进程，保持 `/ws/agent` 连接，把收到的文本
-  写入本机剪贴板。
+服务端优先使用明文环境变量 `RELAY_PASSWORD`。迁移期间，旧环境变量 `API_KEY` 与
+`RELAY_PASSWORD` 会同时有效；两台旧设备都切换到新密码后，管理员需要删除 `API_KEY`
+并重启服务。两个变量都未配置时，HTTP 返回 `500`，WebSocket 以 `1008` 关闭；密码错误时，
+HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
+
+`RELAY_PASSWORD`、迁移期 `API_KEY` 和客户端密码只允许使用 ASCII 字符。任何非 ASCII 候选值
+都会被视为密码错误，并且某个无效候选值不会中断另一个迁移期凭据的校验。
+
+人类可记忆密码的熵低于长随机 API key。当前实现不包含密码哈希和登录限速，因此该方案只适合
+小规模可信环境，不适合直接大规模暴露到公网。
+
+相关环境变量如下：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RELAY_PASSWORD` | 空 | 新共享密码 |
+| `API_KEY` | 空 | 迁移期旧凭据；迁移结束后删除 |
+| `MAX_DEVICES` | `10` | 已注册设备上限，必须是正整数 |
+| `DEVICES_FILE` | `server/devices.json` | 设备清单文件路径 |
 
 ## 设备清单
 
-`device_id` 目前硬编码在 `server/app.py` 的 `DEVICES` 字典里，还不支持通过环境变量配置：
+设备清单以 JSON 文件持久化，每条记录包含 `device_id`、`created_at` 和 `last_active`。
+文件写入采用同目录临时文件加原子替换。注册、删除和 WebSocket 断开更新使用同一把
+`asyncio.Lock`。文件损坏时，服务端会记录警告并以空清单启动。
 
-| device_id     | 说明          |
-|---------------|--------------|
-| `win-fukuoka` | 福冈 Windows  |
-| `mac-china`   | 中国大陆 Mac  |
-
-任何用到 `target`/`device_id` 的地方，只要不在这个字典里，一律被拒绝。
-
-## 鉴权
-
-所有请求（HTTP 和 WebSocket）都必须带：
-
-```
-X-API-Key: <共享密钥>
-```
-
-服务端用 `hmac.compare_digest()` 和环境变量 `API_KEY` 比较。所有设备共用同一把密钥，
-没有按设备区分的密钥。
-
-- 如果服务端 `API_KEY` 未配置：HTTP 返回 `500`，WebSocket 直接以 `1008` 关闭。
-- 如果密钥存在但不对：HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
-- **注意**：`device_id` 无效时同样以 `1008` 关闭——单看关闭码无法区分是鉴权失败
-  还是 device_id 无效。
+`device_id` 会转换为小写，并且只允许 3 至 32 位小写字母、数字或连字符。仓库中的初始清单
+预置 `win-fukuoka` 与 `mac-china`，以支持旧设备平滑迁移。在线状态只保存在内存中，
+`last_active` 只在新设备注册成功和当前 WebSocket 断开时写入。
 
 ## HTTP 接口
 
-### `GET /`
-返回 `server/static/index.html`。无需鉴权。
+### `GET /` 与 `GET /health`
 
-### `GET /health`
-返回 `{"ok": true}`。无需鉴权。供 systemd/Docker/Nginx 健康检查使用。
+`GET /` 返回公开浏览器页面。`GET /health` 返回 `{"ok": true}`。这两个接口不要求鉴权。
+
+### `POST /api/devices/register`
+
+请求体为 `{"device_id":"my-laptop"}`。新设备注册成功时返回 `200` 和完整设备记录。
+已存在的 ID 返回原记录且不重复新增。非法 ID 返回 `400`。达到 `MAX_DEVICES` 后，新 ID 返回
+`403 {"detail":"已达设备数上限"}`，但已注册设备仍然可以确认注册和重连。
+
+### `GET /api/devices`
+
+该接口返回持久字段和实时在线状态：
+
+```json
+[
+  {
+    "device_id": "win-fukuoka",
+    "created_at": "2026-07-11T00:00:00Z",
+    "last_active": "2026-07-11T00:00:00Z",
+    "online": true
+  }
+]
+```
+
+### `DELETE /api/devices/{device_id}`
+
+该接口删除设备记录并腾出上限名额。在线设备会立即收到 `1000` 关闭帧并断开。不存在的设备
+返回 `404`。删除操作不是安全吊销，因为持有共享密码的客户端可以再次注册；真正的访问控制
+边界仍然是共享密码。
 
 ### `POST /api/send`
 
-请求头：`X-API-Key: <密钥>`、`Content-Type: application/json`
-
-请求体：
-```json
-{"target": "win-fukuoka", "text": "..."}
-```
-
-响应：
-
-| 状态码 | 触发条件 |
-|---|---|
-| `200 {"ok": true}` | 已成功推送给对应 Agent |
-| `400 invalid target` | `target` 缺失，或不在 `DEVICES` 里 |
-| `400 text is empty` | `text` 缺失、不是字符串、或全是空白字符 |
-| `401 invalid API key` | 密钥缺失或错误 |
-| `500 API_KEY is not configured` | 服务端没有设置 `API_KEY` |
-| `503 target device is not connected` | 该 `device_id` 当前没有已连接的 WebSocket |
-
-注意事项：
-- 判空只用 `.strip()` 检查，但**真正转发给 Agent 的是原始、未经 strip 的文本**。
-- 服务端从不存储文本；如果目标 Agent 未连接，消息直接丢弃，不会排队等待。
+请求体为 `{"target":"my-laptop","text":"..."}`。成功返回 `200 {"ok":true}`；目标非法
+或文本为空返回 `400`；目标离线返回 `503`。服务端不会存储或排队文本。
 
 ### `GET /api/status`
 
-请求头：`X-API-Key: <共享密钥>`
-
-该接口只读取当前进程内存中的 Agent WebSocket 连接，不会修改连接状态，也不会发送消息。
-无论设备是否在线，响应中的 `devices` 都会包含 `DEVICES` 设备清单中的全部 `device_id`：
-
-```json
-{"devices": {"win-fukuoka": true, "mac-china": false}}
-```
-
-响应：
-
-| 状态码 | 触发条件 |
-|---|---|
-| `200` | 成功返回所有设备的在线布尔状态；`true` 表示该设备当前有已连接的 WebSocket |
-| `401 invalid API key` | 密钥缺失或错误 |
-| `500 API_KEY is not configured` | 服务端没有设置 `API_KEY` |
-
-浏览器发送页面会在密钥非空时首次查询、切换目标设备时查询，并且约每四秒轮询该接口。
-页面会在目标设备下方显示已连接、客户端未连接、密钥错误、服务端配置错误或中继服务器不可达，
-并在设备下拉选项的文字后缀显示“（在线）”或“（离线）”。该连接状态区域独立于发送结果区域。
+该兼容接口返回 `{"devices":{"win-fukuoka":true,"mac-china":false}}`。设备管理页面使用
+信息更完整的 `GET /api/devices`。
 
 ## WebSocket：`/ws/agent`
 
-连接地址：
+Agent 在成功调用注册接口后连接：
+
+```text
+wss://clip.hcid274.cn/ws/agent?device_id=<已注册设备 ID>
 ```
-wss://clip.hcid274.cn/ws/agent?device_id=<win-fukuoka|mac-china>
-```
-请求头：`X-API-Key: <共享密钥>`
 
-服务端连接时的校验顺序：
-1. `X-API-Key` 必须匹配 `API_KEY` —— 否则以 `1008` 关闭
-2. `device_id` 查询参数必须是 `DEVICES` 里的一个 key —— 否则以 `1008` 关闭
-3. 接受连接，按 `device_id` 存入内存
+密码错误、参数非法或设备未注册时，服务端以 `1008` 关闭。相同 `device_id` 的新连接会以
+`1000` 关闭旧连接并取代它。服务端推送消息格式为：
 
-**替换行为**：如果某个 `device_id` 已有一条连接在线，新连接到达时旧连接会以
-`1000`（正常关闭）关闭并被替换。同一个 `device_id` 同一时刻只允许一条活跃连接。
-
-**服务端推给 Agent 的消息**（仅服务端 → Agent 方向；服务端不关心 Agent 回传的
-内容）：
 ```json
-{"type": "clipboard", "text": "..."}
+{"type":"clipboard","text":"..."}
 ```
 
-**保持连接存活**：服务端在循环里调用 `receive_text()`，纯粹是为了侦测断开——
-它会忽略 Agent 发来的任何内容。Agent 可以定时发心跳（ping/文本），但协议本身
-不依赖心跳的具体内容。
+服务端通过 `receive_text()` 检测断线。只有当前有效连接断开时，服务端才会移除内存连接并更新
+该设备的 `last_active`，被同名新连接替换的旧连接不会覆盖当前状态。
 
-**断线处理**：`WebSocketDisconnect` 触发后，服务端会把该 `device_id` 从内存表里
-移除——在新的 Agent 连接顶替它之前，`/api/send` 会认为该目标"未连接"（返回
-`503`）。
+## Agent 首次配置
 
-## 当前约束（现状，不是设计目标）
+安装脚本读取本地配置中的 `device_id`。若该字段存在，脚本直接复用；若该字段不存在，脚本以
+hostname 生成建议值，并允许用户回车确认或手动修改。Agent 调用注册接口成功后，以原子写入方式
+把服务端返回的规范化 ID 保存到配置文件，再建立 WebSocket。密码错误、设备上限和网络错误都会
+显示明确的终端错误。旧配置 URL 中的 `device_id` 会作为已保存身份复用，并会迁移到独立字段。
+每次进程启动都会用已保存 ID 调用注册接口进行重连确认。
 
-- 只能单进程 / 单 worker。连接状态保存在进程内存里——多 worker 或多副本部署会
-  导致 `/api/send` 落到某个不知道该 Agent 连接的 worker 上。要横向扩展，必须先
-  把连接状态迁移到共享存储（例如 Redis pub/sub）。
-- 没有消息队列——目标 Agent 离线时消息直接丢失，不会延迟送达。
-- 没有限流，没有请求体大小限制。
-- 没有按设备区分的密钥——所有设备共用一把。
+## 当前约束
+
+- 服务端只能运行一个 worker，因为设备文件锁和连接表不跨进程共享。
+- 服务端没有消息队列、限流、密码哈希和请求体大小限制。
+- 所有设备共用一个密码，两台物理设备使用同一 ID 时，后连接者会取代先连接者。

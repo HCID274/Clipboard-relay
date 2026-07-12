@@ -1,27 +1,84 @@
+import argparse
 import json
 import logging
 import os
+import re
+import socket
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 import pyperclip
 import websocket
 
 
-EXPECTED_WS_URL = "wss://clip.hcid274.cn/ws/agent?device_id=win-fukuoka"
 TASK_NAME = "ClipboardRelayAgent"
 STABLE_CONNECTION_SECONDS = 60
+CONNECT_TIMEOUT_SECONDS = 8
+DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
+PLACEHOLDER_PASSWORDS = {"replace-with-shared-key", "replace-with-relay-password"}
+AUTHENTICATION_FAILURE_EXIT_CODE = 3
+
+
+class RegistrationError(RuntimeError):
+    pass
+
+
+class AuthenticationError(RegistrationError):
+    pass
+
+
+def get_config_path() -> Path:
+    return Path(__file__).resolve().parent / "config.json"
 
 
 def get_log_path() -> Path:
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        base = Path(appdata)
-    else:
-        base = Path.home() / "AppData" / "Roaming"
+    base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     return base / "ClipboardRelay" / "agent.log"
+
+
+def validate_password(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("password missing from config")
+    password = value.strip()
+    if not password.isascii():
+        raise ValueError("password must contain only ASCII characters")
+    if password in PLACEHOLDER_PASSWORDS:
+        raise ValueError("password still uses placeholder value")
+    return password
+
+
+def config_needs_password(config_path: Path) -> bool:
+    """Return whether a readable config needs a password to be supplied."""
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read config file: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("config root must be a JSON object")
+
+    try:
+        validate_password(config.get("password", config.get("api_key")))
+    except ValueError:
+        return True
+    return False
+
+
+def password_setup_status(config_path: Path) -> int:
+    """Return the installer status for password setup.
+
+    Status 0 requests a password, status 1 means that the existing password is
+    valid, and status 2 means that the config file could not be inspected.
+    """
+    try:
+        needs_password = config_needs_password(config_path)
+    except ValueError:
+        return 2
+    return 0 if needs_password else 1
 
 
 def setup_logging() -> None:
@@ -41,8 +98,8 @@ def setup_logging() -> None:
     logging.info("%s starting, log=%s", TASK_NAME, log_path)
 
 
-def load_config() -> dict[str, Any]:
-    config_path = Path(__file__).resolve().parent / "config.json"
+def load_config(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or get_config_path()
     if not config_path.exists():
         logging.error("config file missing: %s", config_path)
         sys.exit(1)
@@ -62,17 +119,23 @@ def load_config() -> dict[str, Any]:
         sys.exit(1)
 
     server_ws_url = config.get("server_ws_url", config.get("ws_url"))
-    if server_ws_url != EXPECTED_WS_URL:
-        logging.error("server_ws_url must be %s", EXPECTED_WS_URL)
+    if not isinstance(server_ws_url, str) or urlparse(server_ws_url).scheme not in {"ws", "wss"}:
+        logging.error("server_ws_url must be a ws:// or wss:// URL")
         sys.exit(1)
 
-    api_key = config.get("api_key")
-    if not isinstance(api_key, str) or not api_key.strip():
-        logging.error("api_key missing from config")
+    try:
+        api_key = validate_password(config.get("password", config.get("api_key")))
+    except ValueError as exc:
+        logging.error("%s", exc)
         sys.exit(1)
-    api_key = api_key.strip()
-    if api_key == "replace-with-shared-key":
-        logging.error("api_key still uses placeholder value")
+
+    device_id = config.get("device_id")
+    if device_id is None:
+        legacy_device_ids = parse_qs(urlparse(server_ws_url).query).get("device_id")
+        if legacy_device_ids:
+            device_id = legacy_device_ids[0]
+    if device_id is not None and (not isinstance(device_id, str) or not device_id.strip()):
+        logging.error("device_id must be a non-empty string")
         sys.exit(1)
 
     reconnect_seconds = config.get("reconnect_seconds", 5)
@@ -83,8 +146,90 @@ def load_config() -> dict[str, Any]:
     return {
         "server_ws_url": server_ws_url,
         "api_key": api_key,
+        "device_id": device_id,
         "reconnect_seconds": float(reconnect_seconds),
     }
+
+
+def registration_url(server_ws_url: str) -> str:
+    parsed = urlparse(server_ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urlunparse((scheme, parsed.netloc, "/api/devices/register", "", "", ""))
+
+
+def build_agent_ws_url(server_ws_url: str, device_id: str) -> str:
+    parsed = urlparse(server_ws_url)
+    query = parse_qs(parsed.query)
+    query["device_id"] = [device_id]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def suggested_device_id(hostname: str) -> str:
+    suggestion = DEVICE_ID_REPLACEMENT_PATTERN.sub("-", hostname.lower()).strip("-")
+    suggestion = suggestion[:32].rstrip("-")
+    return suggestion if len(suggestion) >= 3 else "my-device"
+
+
+def save_device_id(config_path: Path, device_id: str) -> None:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["device_id"] = device_id
+    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(config_path)
+
+
+def clear_password(config_path: Path) -> None:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be a JSON object")
+    raw["password"] = ""
+    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(config_path)
+
+
+def register_configured_device(
+    config: dict[str, Any], config_path: Path
+) -> dict[str, Any]:
+    device_id = config.get("device_id")
+    if device_id is None:
+        suggestion = suggested_device_id(socket.gethostname())
+        entered = input(f"设备名称 [{suggestion}]: ").strip()
+        device_id = entered or suggestion
+
+    request = Request(
+        registration_url(config["server_ws_url"]),
+        data=json.dumps({"device_id": device_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-API-Key": config["api_key"]},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=CONNECT_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail", exc.reason)
+        except (json.JSONDecodeError, AttributeError):
+            detail = exc.reason
+        error_type = AuthenticationError if exc.code == 401 else RegistrationError
+        raise error_type(f"设备注册失败（HTTP {exc.code}）：{detail}") from exc
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        raise RegistrationError(f"设备注册失败：{exc}") from exc
+
+    registered_id = payload.get("device_id") if isinstance(payload, dict) else None
+    if not isinstance(registered_id, str):
+        raise RegistrationError("设备注册失败：服务端返回了无效响应")
+    try:
+        save_device_id(config_path, registered_id)
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise RegistrationError(f"设备身份保存失败：{exc}") from exc
+    config["device_id"] = registered_id
+    config["server_ws_url"] = build_agent_ws_url(config["server_ws_url"], registered_id)
+    return config
 
 
 def on_open(ws_app: websocket.WebSocketApp) -> None:
@@ -137,9 +282,23 @@ def on_close(
     )
 
 
-def run() -> None:
+def run(*, register_only: bool = False, config_path: Path | None = None) -> None:
     setup_logging()
-    config = load_config()
+    active_config_path = config_path or get_config_path()
+    config = load_config(active_config_path)
+    try:
+        config = register_configured_device(config, active_config_path)
+    except AuthenticationError as exc:
+        logging.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(AUTHENTICATION_FAILURE_EXIT_CODE) from exc
+    except RegistrationError as exc:
+        logging.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
+    if register_only:
+        print(f"设备 {config['device_id']} 注册成功。")
+        return
     reconnect_seconds = config["reconnect_seconds"]
     reconnect_attempts = 0
 
@@ -190,4 +349,8 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Run the Windows Clipboard Relay Agent.")
+    parser.add_argument("--register-only", action="store_true")
+    parser.add_argument("--config", type=Path, default=get_config_path())
+    arguments = parser.parse_args()
+    run(register_only=arguments.register_only, config_path=arguments.config)

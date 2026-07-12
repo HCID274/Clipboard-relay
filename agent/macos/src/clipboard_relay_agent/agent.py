@@ -1,23 +1,34 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import os
+import re
+import socket
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 import pyperclip
 import websocket
 
-from clipboard_relay_agent.config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
+from clipboard_relay_agent.config import (
+    DEFAULT_CONFIG_PATH,
+    Config,
+    ConfigError,
+    load_config,
+    save_device_id,
+)
 
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "ClipboardRelay"
@@ -33,6 +44,25 @@ LOG_BACKUP_COUNT = 3
 STATIC_HOST_IPS = {
     "clip.hcid274.cn": "64.176.40.67",
 }
+DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
+
+
+class RegistrationError(RuntimeError):
+    """Raised when the server rejects or cannot complete device registration."""
+
+
+class StaticAddressHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, connect_host: str, tls_host: str, port: int, timeout: int) -> None:
+        super().__init__(tls_host, port=port, timeout=timeout)
+        self.connect_host = connect_host
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self.connect_host, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 @dataclass(frozen=True)
@@ -52,9 +82,7 @@ def build_connection_target(server_ws_url: str) -> ConnectionTarget:
     if static_ip is None:
         return ConnectionTarget(url=server_ws_url, host=None, sslopt=None)
 
-    netloc = static_ip
-    if parsed.port is not None:
-        netloc = f"{static_ip}:{parsed.port}"
+    netloc = f"{static_ip}:{parsed.port}" if parsed.port is not None else static_ip
 
     rewritten_url = urlunparse(parsed._replace(netloc=netloc))
     return ConnectionTarget(
@@ -66,6 +94,103 @@ def build_connection_target(server_ws_url: str) -> ConnectionTarget:
 
 def build_headers(api_key: str) -> list[str]:
     return [f"X-API-Key: {api_key}"]
+
+
+def registration_url(server_ws_url: str) -> str:
+    parsed = urlparse(server_ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urlunparse((scheme, parsed.netloc, "/api/devices/register", "", "", ""))
+
+
+def build_agent_ws_url(server_ws_url: str, device_id: str) -> str:
+    parsed = urlparse(server_ws_url)
+    query = parse_qs(parsed.query)
+    query["device_id"] = [device_id]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def suggested_device_id(hostname: str) -> str:
+    suggestion = DEVICE_ID_REPLACEMENT_PATTERN.sub("-", hostname.lower()).strip("-")
+    suggestion = suggestion[:32].rstrip("-")
+    return suggestion if len(suggestion) >= 3 else "my-device"
+
+
+def _registration_error(status_code: int, reason: str, body: bytes) -> RegistrationError:
+    try:
+        detail = json.loads(body.decode("utf-8")).get("detail", reason)
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        detail = reason
+    return RegistrationError(f"设备注册失败（HTTP {status_code}）：{detail}")
+
+
+def send_registration_request(
+    server_ws_url: str, password: str, device_id: str
+) -> dict[str, Any]:
+    url = registration_url(server_ws_url)
+    parsed = urlparse(url)
+    body = json.dumps({"device_id": device_id}).encode("utf-8")
+    headers = {"Content-Type": "application/json", "X-API-Key": password}
+    static_ip = STATIC_HOST_IPS.get(parsed.hostname or "")
+
+    try:
+        if parsed.scheme == "https" and static_ip is not None and parsed.hostname is not None:
+            connection = StaticAddressHTTPSConnection(
+                static_ip,
+                parsed.hostname,
+                parsed.port or 443,
+                CONNECT_TIMEOUT_SECONDS,
+            )
+            try:
+                connection.request("POST", parsed.path, body=body, headers=headers)
+                response = connection.getresponse()
+                response_body = response.read()
+                if response.status >= 400:
+                    raise _registration_error(response.status, response.reason, response_body)
+            finally:
+                connection.close()
+        else:
+            request = Request(url, data=body, headers=headers, method="POST")
+            try:
+                with urlopen(request, timeout=CONNECT_TIMEOUT_SECONDS) as response:
+                    response_body = response.read()
+            except HTTPError as exc:
+                raise _registration_error(exc.code, exc.reason, exc.read()) from exc
+        payload = json.loads(response_body.decode("utf-8"))
+    except RegistrationError:
+        raise
+    except (
+        OSError,
+        URLError,
+        http.client.HTTPException,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise RegistrationError(f"设备注册失败：{exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise RegistrationError("设备注册失败：服务端返回了无效响应")
+    return payload
+
+
+def register_configured_device(
+    config: Config,
+    config_path: Path,
+    *,
+    prompt: Callable[[str], str] = input,
+    hostname: str | None = None,
+) -> Config:
+    device_id = config.device_id
+    if device_id is None:
+        suggestion = suggested_device_id(hostname or socket.gethostname())
+        entered = prompt(f"设备名称 [{suggestion}]: ").strip()
+        device_id = entered or suggestion
+
+    payload = send_registration_request(config.server_ws_url, config.api_key, device_id)
+    registered_id = payload.get("device_id") if isinstance(payload, dict) else None
+    if not isinstance(registered_id, str):
+        raise RegistrationError("设备注册失败：服务端返回了无效响应")
+    save_device_id(config_path, registered_id)
+    return replace(config, device_id=registered_id)
 
 
 def extract_device_id(server_ws_url: str) -> str:
@@ -173,12 +298,14 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
 
     while True:
         current_reconnect_attempts = reconnect_attempts
-        connection_target = build_connection_target(config.server_ws_url)
+        device_id = config.device_id or extract_device_id(config.server_ws_url)
+        websocket_url = build_agent_ws_url(config.server_ws_url, device_id)
+        connection_target = build_connection_target(websocket_url)
 
         def on_open(_ws: websocket.WebSocketApp) -> None:
-            logger.info("connected to %s", config.server_ws_url)
+            logger.info("connected to %s", websocket_url)
             update_status(
-                server_ws_url=config.server_ws_url,
+                server_ws_url=websocket_url,
                 connected=True,
                 event="connected",
                 reconnect_attempts=current_reconnect_attempts,
@@ -187,7 +314,7 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
         def on_message(_ws: websocket.WebSocketApp, msg: str) -> None:
             handle_message(msg, logger=logger)
             update_status(
-                server_ws_url=config.server_ws_url,
+                server_ws_url=websocket_url,
                 connected=True,
                 event="message",
                 reconnect_attempts=current_reconnect_attempts,
@@ -196,7 +323,7 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
         def on_error(_ws: websocket.WebSocketApp, err: Any) -> None:
             logger.error("websocket error: %s", err)
             update_status(
-                server_ws_url=config.server_ws_url,
+                server_ws_url=websocket_url,
                 connected=False,
                 event="error",
                 reconnect_attempts=current_reconnect_attempts,
@@ -206,7 +333,7 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
         def on_close(_ws: websocket.WebSocketApp, status: int | None, reason: str | None) -> None:
             logger.info("websocket closed status=%s reason=%s", status, reason)
             update_status(
-                server_ws_url=config.server_ws_url,
+                server_ws_url=websocket_url,
                 connected=False,
                 event="closed",
                 reconnect_attempts=current_reconnect_attempts,
@@ -251,6 +378,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_CONFIG_PATH,
         help=f"Path to config.json. Defaults to {DEFAULT_CONFIG_PATH}",
     )
+    parser.add_argument(
+        "--register-only",
+        action="store_true",
+        help="Register the configured device and exit without starting the WebSocket loop.",
+    )
     return parser.parse_args(argv)
 
 
@@ -260,9 +392,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(args.config)
-    except ConfigError as exc:
+        config = register_configured_device(config, args.config)
+    except (ConfigError, RegistrationError) as exc:
         logger.error("%s", exc)
+        print(str(exc), file=sys.stderr)
         return 1
+
+    if args.register_only:
+        print(f"设备 {config.device_id} 注册成功。")
+        return 0
 
     run_agent(config, logger)
     return 0

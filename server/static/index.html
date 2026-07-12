@@ -136,6 +136,50 @@
         color: #b3261e;
       }
 
+      .device-panel {
+        margin-top: 28px;
+        border-top: 1px solid #c8c8c2;
+        padding-top: 12px;
+      }
+
+      .device-panel h2 {
+        margin-bottom: 4px;
+        font-size: 19px;
+      }
+
+      .device-list {
+        display: grid;
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      .device-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        border: 1px solid #c8c8c2;
+        border-radius: 8px;
+        padding: 12px;
+      }
+
+      .device-name {
+        font-weight: 700;
+      }
+
+      .device-meta {
+        margin-top: 4px;
+        color: #5f6368;
+        font-size: 13px;
+      }
+
+      .delete-device {
+        width: auto;
+        margin: 0;
+        background: #b3261e;
+        padding: 8px 12px;
+      }
+
       @media (prefers-color-scheme: dark) {
         :root {
           background: #111315;
@@ -148,6 +192,15 @@
           border-color: #4b4f54;
           background: #1b1f23;
         }
+
+        .device-panel,
+        .device-row {
+          border-color: #4b4f54;
+        }
+
+        .device-meta {
+          color: #bdc1c6;
+        }
       }
     </style>
   </head>
@@ -155,18 +208,15 @@
     <main>
       <h1>Clipboard Relay</h1>
 
-      <label for="apiKey">密钥</label>
+      <label for="apiKey">密码</label>
       <input id="apiKey" autocomplete="off" inputmode="text" type="password" />
-      <button id="clearKey" class="secondary" type="button">清除密钥</button>
+      <button id="clearKey" class="secondary" type="button">清除密码</button>
 
       <label for="target">目标设备</label>
-      <select id="target">
-        <option value="win-fukuoka">福冈 Windows</option>
-        <option value="mac-china">中国大陆 Mac</option>
-      </select>
+      <select id="target"></select>
       <div id="connectionStatus" class="connection-status" aria-live="polite">
         <span class="connection-status-dot" aria-hidden="true"></span>
-        <span id="connectionStatusText">请输入密钥以查询设备连接状态。</span>
+        <span id="connectionStatusText">请输入密码以查询设备连接状态。</span>
       </div>
 
       <label for="text">文本</label>
@@ -174,6 +224,14 @@
 
       <button id="send" type="button">发送到目标设备剪贴板</button>
       <div id="status" aria-live="polite"></div>
+
+      <section class="device-panel" aria-labelledby="devicePanelTitle">
+        <h2 id="devicePanelTitle">设备管理</h2>
+        <div id="deviceListStatus" class="device-meta" aria-live="polite">
+          请输入密码以查看已注册设备。
+        </div>
+        <div id="deviceList" class="device-list"></div>
+      </section>
     </main>
 
     <script>
@@ -187,12 +245,9 @@
       const statusEl = document.querySelector("#status");
       const connectionStatusEl = document.querySelector("#connectionStatus");
       const connectionStatusTextEl = document.querySelector("#connectionStatusText");
-      const deviceNames = Object.fromEntries(
-        [...targetSelect.options].map((option) => [option.value, option.textContent]),
-      );
-      let deviceStatuses = Object.fromEntries(
-        [...targetSelect.options].map((option) => [option.value, false]),
-      );
+      const deviceListEl = document.querySelector("#deviceList");
+      const deviceListStatusEl = document.querySelector("#deviceListStatus");
+      let devices = [];
       const STATUS_POLL_INTERVAL_MS = 4000;
       let latestConnectionStatusRequestId = 0;
 
@@ -212,26 +267,53 @@
       }
 
       function updateTargetOptions() {
-        const selectedTarget = targetSelect.value;
-        let labelsChanged = false;
-        for (const option of targetSelect.options) {
-          const suffix = deviceStatuses[option.value] ? "（在线）" : "（离线）";
-          const label = `${deviceNames[option.value]}${suffix}`;
-          if (option.textContent !== label) {
-            option.textContent = label;
-            labelsChanged = true;
-          }
-        }
+        const selectedTarget = targetSelect.value || localStorage.getItem(TARGET_STORAGE_KEY);
+        const options = devices.map((device) => {
+          const option = document.createElement("option");
+          option.value = device.device_id;
+          option.textContent = `${device.device_id}${device.online ? "（在线）" : "（离线）"}`;
+          option.selected = device.device_id === selectedTarget;
+          return option;
+        });
+        targetSelect.replaceChildren(...options);
+      }
 
-        if (labelsChanged) {
-          const refreshedOptions = [...targetSelect.options].map((option) => {
-            const refreshedOption = option.cloneNode(true);
-            refreshedOption.selected = option.value === selectedTarget;
-            return refreshedOption;
-          });
-          targetSelect.replaceChildren(...refreshedOptions);
-          targetSelect.value = selectedTarget;
-        }
+      function clearDevices() {
+        devices = [];
+        updateTargetOptions();
+        deviceListEl.replaceChildren();
+      }
+
+      function formatLastActive(value) {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+      }
+
+      function createDeviceRow(device) {
+        const row = document.createElement("div");
+        row.className = "device-row";
+
+        const details = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "device-name";
+        name.textContent = `${device.device_id} · ${device.online ? "在线" : "离线"}`;
+        const metadata = document.createElement("div");
+        metadata.className = "device-meta";
+        metadata.textContent = `最后活跃：${formatLastActive(device.last_active)}`;
+        details.append(name, metadata);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "delete-device";
+        deleteButton.dataset.deviceId = device.device_id;
+        deleteButton.textContent = "删除";
+        row.append(details, deleteButton);
+        return row;
+      }
+
+      function renderDeviceList() {
+        deviceListEl.replaceChildren(...devices.map(createDeviceRow));
+        deviceListStatusEl.textContent = devices.length ? `共 ${devices.length} 台设备。` : "当前没有已注册设备。";
       }
 
       function setConnectionStatus(message, kind) {
@@ -243,12 +325,14 @@
         const requestId = ++latestConnectionStatusRequestId;
         const apiKey = apiKeyInput.value.trim();
         if (!apiKey) {
-          setConnectionStatus("请输入密钥以查询设备连接状态。", "");
+          clearDevices();
+          deviceListStatusEl.textContent = "请输入密码以查看已注册设备。";
+          setConnectionStatus("请输入密码以查询设备连接状态。", "");
           return;
         }
 
         try {
-          const response = await fetch("/api/status", {
+          const response = await fetch("/api/devices", {
             headers: { "X-API-Key": apiKey },
           });
 
@@ -257,11 +341,13 @@
           }
 
           if (response.status === 401) {
-            setConnectionStatus("密钥错误。", "error");
+            clearDevices();
+            setConnectionStatus("密码错误。", "error");
+            deviceListStatusEl.textContent = "密码错误。";
             return;
           }
           if (response.status === 500) {
-            setConnectionStatus("服务端配置错误：API_KEY 未配置。", "error");
+            setConnectionStatus("服务端密码未配置。", "error");
             return;
           }
           if (!response.ok) {
@@ -270,7 +356,7 @@
           }
 
           const payload = await response.json();
-          if (!payload.devices || typeof payload.devices !== "object") {
+          if (!Array.isArray(payload)) {
             throw new Error("invalid status payload");
           }
 
@@ -278,17 +364,18 @@
             return;
           }
 
-          for (const deviceId of Object.keys(deviceStatuses)) {
-            deviceStatuses[deviceId] = payload.devices[deviceId] === true;
-          }
+          devices = payload;
           updateTargetOptions();
+          renderDeviceList();
 
           const target = targetSelect.value;
-          const targetName = deviceNames[target];
-          if (deviceStatuses[target]) {
-            setConnectionStatus(`${targetName}已连接。`, "online");
+          const selectedDevice = devices.find((device) => device.device_id === target);
+          if (!selectedDevice) {
+            setConnectionStatus("当前没有可用设备。", "offline");
+          } else if (selectedDevice.online) {
+            setConnectionStatus(`${target}已连接。`, "online");
           } else {
-            setConnectionStatus(`${targetName}未连接。`, "offline");
+            setConnectionStatus(`${target}未连接。`, "offline");
           }
         } catch (error) {
           if (requestId === latestConnectionStatusRequestId) {
@@ -301,8 +388,32 @@
         localStorage.removeItem(API_KEY_STORAGE_KEY);
         apiKeyInput.value = "";
         apiKeyInput.focus();
-        setStatus("密钥已清除。", "");
+        setStatus("密码已清除。", "");
         refreshConnectionStatus();
+      });
+
+      deviceListEl.addEventListener("click", async (event) => {
+        const button = event.target.closest(".delete-device");
+        if (!button) return;
+        const deviceId = button.dataset.deviceId;
+        if (!window.confirm(`确定要删除设备“${deviceId}”吗？在线连接会立即断开。`)) return;
+
+        button.disabled = true;
+        try {
+          const response = await fetch(`/api/devices/${encodeURIComponent(deviceId)}`, {
+            method: "DELETE",
+            headers: { "X-API-Key": apiKeyInput.value.trim() },
+          });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `HTTP ${response.status}`);
+          }
+          setStatus(`设备 ${deviceId} 已删除。`, "ok");
+          await refreshConnectionStatus();
+        } catch (error) {
+          setStatus(`删除失败：${error.message}`, "bad");
+          button.disabled = false;
+        }
       });
 
       targetSelect.addEventListener("change", () => {
@@ -320,7 +431,12 @@
         const text = textInput.value;
 
         if (!apiKey) {
-          setStatus("请输入密钥。", "bad");
+          setStatus("请输入密码。", "bad");
+          return;
+        }
+
+        if (!target) {
+          setStatus("当前没有可用设备。", "bad");
           return;
         }
 
@@ -348,7 +464,7 @@
             textInput.value = "";
             setStatus("发送成功。", "ok");
           } else if (response.status === 401) {
-            setStatus("密钥错误。", "bad");
+            setStatus("密码错误。", "bad");
           } else if (response.status === 503) {
             setStatus("目标设备未连接。", "bad");
           } else if (response.status === 400) {

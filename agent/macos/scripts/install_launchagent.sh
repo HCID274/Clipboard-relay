@@ -18,17 +18,64 @@ mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   cp "$PROJECT_DIR/config.example.json" "$CONFIG_PATH"
-  echo "Created $CONFIG_PATH. Edit api_key before starting the LaunchAgent." >&2
-  exit 1
-fi
-
-if grep -q "replace-with-existing-shared-key" "$CONFIG_PATH"; then
-  echo "Edit api_key in $CONFIG_PATH before starting the LaunchAgent." >&2
-  exit 1
+  echo "Created $CONFIG_PATH from config.example.json."
 fi
 
 "$UV_BIN" python install 3.12
 "$UV_BIN" sync --frozen --project "$PROJECT_DIR"
+
+password_needs_setup() {
+  "$PROJECT_DIR/.venv/bin/python" - "$CONFIG_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+from clipboard_relay_agent.config import ConfigError, config_needs_password
+
+try:
+    needs_password = config_needs_password(Path(sys.argv[1]))
+except ConfigError as exc:
+    print(f"Cannot inspect config password: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+raise SystemExit(0 if needs_password else 1)
+PY
+}
+
+set +e
+password_needs_setup
+password_status=$?
+set -e
+
+if [[ $password_status -eq 0 ]]; then
+  echo "Enter the Clipboard Relay shared password. Your input will not be displayed."
+  while true; do
+    printf "Password: "
+    IFS= read -r -s password
+    printf "\n"
+
+    if printf '%s' "$password" | "$PROJECT_DIR/.venv/bin/python" -c '
+import sys
+from pathlib import Path
+
+from clipboard_relay_agent.config import ConfigError, set_password
+
+try:
+    set_password(Path(sys.argv[1]), sys.stdin.read())
+except ConfigError as exc:
+    print(f"Password was not saved: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+' "$CONFIG_PATH"
+    then
+      break
+    fi
+
+    echo "Please enter a non-placeholder ASCII password."
+  done
+elif [[ $password_status -ne 1 ]]; then
+  exit "$password_status"
+fi
+
+"$PROJECT_DIR/.venv/bin/python" -m clipboard_relay_agent --config "$CONFIG_PATH" --register-only
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

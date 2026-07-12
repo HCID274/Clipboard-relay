@@ -1,10 +1,11 @@
-# Agent（客户端）
+# Clipboard Relay Agents
 
-各平台的剪贴板客户端实现都放在这里。每个 Agent 连接大阪中继服务的 WebSocket
-（`wss://clip.hcid274.cn/ws/agent?device_id=...`），把收到的文本写入本机剪贴板。
-共用的协议契约见 [docs/protocol.md](../docs/protocol.md)。
+`macos/` 和 `windows/` 分别包含两个桌面剪贴板 Agent。两个 Agent 都从配置文件读取服务地址和
+共享密码，调用 `POST /api/devices/register` 后再连接 `/ws/agent`。
 
-- `macos/` —— Python LaunchAgent（`clipboard_relay_agent`），device_id 为
-  `mac-china`。已测试，正在运行中。详见 `macos/README.md`。
-- `windows/` —— Python 脚本 + 计划任务（Task Scheduler），device_id 为
-  `win-fukuoka`。已测试，正在运行中。详见 `windows/README.md`。
+首次安装时，安装流程会以 hostname 提供设备名建议，并允许用户确认或修改。服务端注册成功后，
+Agent 会把规范化后的 `device_id` 持久化到本地配置；后续启动会复用该身份，不会根据用户名或
+变化后的 hostname 重新生成。
+
+各平台的具体安装步骤请查看 [macOS README](macos/README.md) 和
+[Windows README](windows/README.md)。协议契约请查看 [协议文档](../docs/protocol.md)。

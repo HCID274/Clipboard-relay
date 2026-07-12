@@ -1,78 +1,38 @@
 # Mac 剪贴板中继 Agent
 
-用户级 macOS Agent，连接大阪剪贴板中继服务的 WebSocket，把收到的文本写入当前
-登录用户的剪贴板。
+该 Agent 使用用户级 LaunchAgent 接收剪贴板文本。配置文件位于
+`~/Library/Application Support/ClipboardRelay/config.json`，状态文件位于同一目录，轮转日志位于
+`~/Library/Logs/ClipboardRelay/agent.log`。
 
-## 路径
+## 安装与注册
 
-- 项目位置：本仓库的 `agent/macos/`（此前是独立项目，位于
-  `~/Documents/Codex/01_projects/clipboard-relay-agent-mac`，已合并进 monorepo）
-- 配置文件：`~/Library/Application Support/ClipboardRelay/config.json`
-- 状态文件：`~/Library/Application Support/ClipboardRelay/status.json`
-- 日志：`~/Library/Logs/ClipboardRelay/agent.log`，1 MB 轮转，保留 3 份
-- LaunchAgent：`~/Library/LaunchAgents/com.clipboardrelay.agent.plist`
+在 Finder 中双击 `一键安装.command` 即可完成安装。该入口会打开终端，首次安装时会隐藏回显地要求输入
+服务端共享密码，然后自动安装依赖、注册设备并安装 LaunchAgent。
 
-## 安装配置
+也可以在终端中运行：
 
 ```bash
 cd agent/macos
-~/.local/bin/uv sync
-mkdir -p "$HOME/Library/Application Support/ClipboardRelay"
-cp config.example.json "$HOME/Library/Application Support/ClipboardRelay/config.json"
-```
-
-编辑 `~/Library/Application Support/ClipboardRelay/config.json` 里的 `api_key`。
-
-## 前台测试
-
-```bash
-~/.local/bin/uv run python -m clipboard_relay_agent
-```
-
-发一条路由测试：
-
-```bash
-curl -X POST https://clip.hcid274.cn/api/send \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: existing-shared-key" \
-  -d '{"target":"mac-china","text":"mac route test"}'
-```
-
-检查结果：
-
-```bash
-pbpaste
-```
-
-## 诊断排查
-
-查看当前 LaunchAgent 进程：
-
-```bash
-launchctl print "gui/$(id -u)/com.clipboardrelay.agent"
-```
-
-查看 Agent 写入的最新连接状态：
-
-```bash
-cat "$HOME/Library/Application Support/ClipboardRelay/status.json"
-```
-
-状态文件记录了目标 `device_id`、WebSocket 地址、最近一次事件、进程 ID，以及
-Agent 当前认为的连接状态。
-
-## 后台安装
-
-```bash
 scripts/install_launchagent.sh
-launchctl list | grep clipboardrelay
+```
+
+首次运行会自动复制 `config.example.json`，并且安装脚本会隐藏回显地要求输入 `password`，因此用户
+不需要手动编辑任何配置文件。密码已填写且有效时，脚本会跳过密码提示，因而可以安全地重复运行。
+脚本会显示从 hostname 生成的设备名建议；用户可以回车确认或输入新名称。注册成功后，服务端返回的
+`device_id` 会保存到配置文件，并且 LaunchAgent 才会启动。
+`password` 只允许使用 ASCII 字符，并且管理员应当配置足够长的随机密码或随机英文词组。
+
+旧配置中的 `api_key` 字段仍可读取，便于迁移；建议将该字段改名为 `password`。已有
+`device_id` 时，安装和启动会直接复用该身份，不再询问设备名。正常启动仍会向注册接口确认
+该设备存在，密码错误、设备数达到上限或网络失败都会显示明确错误并阻止后台安装。
+
+## 前台测试与诊断
+
+```bash
+~/.local/bin/uv run python -m clipboard_relay_agent --register-only
+~/.local/bin/uv run python -m clipboard_relay_agent
+launchctl print "gui/$(id -u)/com.clipboardrelay.agent"
 tail -n 100 "$HOME/Library/Logs/ClipboardRelay/agent.log"
 ```
 
-LaunchAgent 会以后台进程方式安装，低 I/O 优先级，30 秒启动节流。
-
-## 卸载
-
-```bash
-scripts/uninstall_launchagent.sh
-```
+卸载命令是 `scripts/uninstall_launchagent.sh`。日志只记录文本长度，不记录剪贴板正文或密码。

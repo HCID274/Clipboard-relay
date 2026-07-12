@@ -1,5 +1,5 @@
 {
-  "server_ws_url": "wss://clip.hcid274.cn/ws/agent?device_id=win-fukuoka",
-  "api_key": "replace-with-shared-key",
+  "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+  "password": "replace-with-relay-password",
   "reconnect_seconds": 5
 }
