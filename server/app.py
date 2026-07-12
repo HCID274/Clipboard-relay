@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -183,8 +184,129 @@ def _normalize_device_id(value: Any) -> str:
 
 
 # 应用层 RTT：服务端发 ping、Agent 回 pong；列表接口返回缓存的 latency_ms。
-LATENCY_PROBE_INTERVAL_SECONDS = 3.0
-LATENCY_PROBE_TIMEOUT_SECONDS = 1.5
+# 探测周期和超时均保持在一秒以内，以便半开连接不会长期显示为在线。
+LATENCY_PROBE_INTERVAL_SECONDS = 0.75
+LATENCY_PROBE_TIMEOUT_SECONDS = 0.75
+UI_TICKET_TTL_SECONDS = 60.0
+MAX_UI_CLIENTS = 32
+
+
+class UiTickets:
+    """浏览器用共享密码换取的一次性短期票据，票据绝不包含共享密码。"""
+
+    def __init__(self) -> None:
+        self._tickets: dict[str, float] = {}
+
+    def _discard_expired(self, now: float) -> None:
+        for token, expires_at in tuple(self._tickets.items()):
+            if expires_at <= now:
+                self._tickets.pop(token, None)
+
+    def issue(self) -> str:
+        now = time.monotonic()
+        self._discard_expired(now)
+        # 票据存储同样有上限，避免反复登录请求无限占用单 worker 的内存。
+        while len(self._tickets) >= MAX_UI_CLIENTS * 4:
+            oldest_token = next(iter(self._tickets))
+            self._tickets.pop(oldest_token, None)
+        token = uuid.uuid4().hex
+        self._tickets[token] = now + UI_TICKET_TTL_SECONDS
+        return token
+
+    def consume(self, token: str | None) -> bool:
+        if not isinstance(token, str):
+            return False
+        now = time.monotonic()
+        self._discard_expired(now)
+        expires_at = self._tickets.pop(token, None)
+        return expires_at is not None and expires_at > now
+
+
+@dataclass(eq=False)
+class _UiClient:
+    """每个浏览器拥有一个只保留最新快照的有界队列。"""
+
+    websocket: WebSocket
+    queue: asyncio.Queue[dict[str, Any]]
+    sender_task: asyncio.Task[None]
+
+
+class UiConnections:
+    """浏览器状态订阅者；慢客户端只会丢弃旧快照，不会拖慢其他客户端。"""
+
+    def __init__(self) -> None:
+        self._clients: set[_UiClient] = set()
+        self._lock = asyncio.Lock()
+
+    async def connect(
+        self,
+        websocket: WebSocket,
+        snapshot_factory: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> _UiClient | None:
+        await websocket.accept()
+        async with self._lock:
+            if len(self._clients) < MAX_UI_CLIENTS:
+                # 初始快照的生成、客户端入订和后续推送共用此锁，避免新客户端错过中间版本。
+                snapshot = await snapshot_factory()
+                queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+                sender_task = asyncio.create_task(
+                    self._send_loop(websocket, queue), name="ui-snapshot-sender"
+                )
+                client = _UiClient(websocket, queue, sender_task)
+                self._clients.add(client)
+                queue.put_nowait(snapshot)
+                return client
+        # 不在管理锁中等待关闭帧，避免异常浏览器阻塞其他 UI 客户端的连接管理。
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return None
+
+    async def disconnect(self, client: _UiClient) -> None:
+        async with self._lock:
+            self._clients.discard(client)
+        client.sender_task.cancel()
+
+    async def publish(
+        self, snapshot_factory: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> None:
+        """在订阅锁内生成并投递最新快照，投递过程不会等待网络 I/O。"""
+        async with self._lock:
+            self._publish_locked(await snapshot_factory())
+
+    def _publish_locked(self, snapshot: dict[str, Any]) -> None:
+        """将快照放入所有客户端的单槽队列；调用方必须持有订阅锁。"""
+        for client in tuple(self._clients):
+            if client.queue.full():
+                try:
+                    client.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                client.queue.put_nowait(snapshot)
+            except asyncio.QueueFull:
+                # 发送协程可能恰好取走了旧消息；下一次状态变化会再次投递快照。
+                pass
+
+    async def _send_loop(
+        self, websocket: WebSocket, queue: asyncio.Queue[dict[str, Any]]
+    ) -> None:
+        try:
+            while True:
+                await websocket.send_json(await queue.get())
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            raise
+        except Exception:
+            # 浏览器断开或网络发送失败时，发送协程自行退出并回收客户端槽位。
+            return
+        finally:
+            sender_task = asyncio.current_task()
+            async with self._lock:
+                for client in tuple(self._clients):
+                    if client.sender_task is sender_task:
+                        self._clients.discard(client)
+
+
+ui_tickets = UiTickets()
+ui_clients = UiConnections()
 
 
 @dataclass
@@ -213,7 +335,7 @@ class AgentConnections:
 
     def _clear_latency_state(self, device_id: str) -> None:
         self._cancel_pending(device_id)
-        self.latency_ms.pop(device_id, None)
+        self.latency_ms[device_id] = None
 
     async def connect(self, device_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -291,12 +413,19 @@ class AgentConnections:
         timeout: float = LATENCY_PROBE_TIMEOUT_SECONDS,
     ) -> int | None:
         """对在线 Agent 发应用层 ping，等待匹配 pong，返回整毫秒 RTT；失败返回 None。"""
-        websocket = self.websockets.get(device_id)
-        if websocket is None:
-            self.latency_ms.pop(device_id, None)
+        # 后台周期和新连接的立即探测可能重叠；已有探测时绝不能取消并重发。
+        if device_id in self._pending_pings:
             return None
 
-        self._cancel_pending(device_id)
+        websocket = self.websockets.get(device_id)
+        if websocket is None:
+            self.latency_ms[device_id] = None
+            return None
+        # 真实 Starlette WebSocket 必然提供 send_json；此分支让测试替身或内部错误不被误判为
+        # Agent 网络半开，从而避免服务端因为自身调用错误踢掉有效连接。
+        if not callable(getattr(websocket, "send_json", None)):
+            LOGGER.warning("agent websocket %s has no send_json method", device_id)
+            return None
 
         loop = asyncio.get_running_loop()
         probe_id = uuid.uuid4().hex
@@ -307,17 +436,24 @@ class AgentConnections:
             websocket=websocket,
         )
         self._pending_pings[device_id] = pending
-        try:
+
+        async def send_ping_and_wait_for_pong() -> None:
+            """在同一超时预算内完成 ping 发送和匹配 pong 等待。"""
             await websocket.send_json(
                 {"type": "ping", "id": probe_id, "t": sent_at}
             )
-            await asyncio.wait_for(pending.future, timeout=timeout)
+            await pending.future
+
+        try:
+            # 半开连接可能让发送永久阻塞；超时必须同时约束发送和 pong 等待。
+            await asyncio.wait_for(send_ping_and_wait_for_pong(), timeout=timeout)
             # 若测速过程中连接被替换，丢弃结果（避免把旧会话 RTT 记到新连接）。
             if self.websockets.get(device_id) is not websocket:
                 self.latency_ms[device_id] = None
                 return None
             ms = max(0, int(round((time.perf_counter() - sent_at) * 1000)))
             self.latency_ms[device_id] = ms
+            await publish_device_snapshot()
             return ms
         except asyncio.CancelledError:
             # 重连/删除取消了 pending.future 时，wait_for 会抛 CancelledError。
@@ -325,9 +461,10 @@ class AgentConnections:
                 self.latency_ms[device_id] = None
             return None
         except Exception:
-            # 超时、发送失败：不保留过期延迟，前端显示 "—"。
+            # 超时或发送失败不仅清除 RTT，还要撤销连接，避免半开 Agent 假在线。
             if self.websockets.get(device_id) is websocket:
                 self.latency_ms[device_id] = None
+                await mark_agent_unavailable(device_id, websocket)
             return None
         finally:
             if self._pending_pings.get(device_id) is pending:
@@ -335,6 +472,56 @@ class AgentConnections:
 
 
 agents = AgentConnections()
+device_state_version = 0
+
+
+def _device_records_locked(*, fresh_online_last_active: bool = True) -> list[dict[str, Any]]:
+    """在 device_lock 保护下生成浏览器和 REST 共用的实时设备记录。"""
+    any_online = any(device_id in agents.websockets for device_id in DEVICES)
+    now = _now() if fresh_online_last_active and any_online else None
+    records: list[dict[str, Any]] = []
+    for device_id, record in sorted(DEVICES.items()):
+        online = device_id in agents.websockets
+        records.append(
+            {
+                **record,
+                "last_active": now if online and now is not None else record["last_active"],
+                "online": online,
+                "latency_ms": agents.latency_ms.get(device_id) if online else None,
+            }
+        )
+    return records
+
+
+async def device_snapshot() -> dict[str, Any]:
+    """生成带单调版本号的全量快照，客户端可以安全地忽略乱序旧消息。"""
+    global device_state_version
+    async with device_lock:
+        device_state_version += 1
+        return {
+            "type": "devices_snapshot",
+            "version": device_state_version,
+            # 推送快照不需要为了展示“当前时刻”消耗时间戳；连接、断开和注册仍会持久化它。
+            "devices": _device_records_locked(fresh_online_last_active=False),
+        }
+
+
+async def publish_device_snapshot() -> None:
+    """在 UI 订阅锁内生成并投递全量快照，保证建连不会漏掉版本。"""
+    await ui_clients.publish(device_snapshot)
+
+
+async def mark_agent_unavailable(device_id: str, websocket: WebSocket) -> None:
+    """探测失败时撤销当前连接并关闭套接字，修复半开连接造成的假在线。"""
+    async with device_lock:
+        if not agents.disconnect(device_id, websocket):
+            return
+        _update_last_active(device_id)
+    try:
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+    except Exception as close_error:
+        LOGGER.warning("failed to close timed-out agent websocket %s: %s", device_id, close_error)
+    await publish_device_snapshot()
 
 
 async def _latency_probe_loop() -> None:
@@ -345,10 +532,11 @@ async def _latency_probe_loop() -> None:
             online_ids = list(agents.websockets)
             if not online_ids:
                 continue
-            await asyncio.gather(
-                *(agents.measure_latency(device_id) for device_id in online_ids),
-                return_exceptions=True,
-            )
+            for device_id in online_ids:
+                # measure_latency 会自行拒绝重叠探测；每轮不等待超时，周期保持不超过一秒。
+                asyncio.create_task(
+                    agents.measure_latency(device_id), name=f"latency-{device_id}"
+                )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -381,6 +569,15 @@ async def health() -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.post("/api/ui-ticket")
+async def create_ui_ticket(
+    x_api_key: str | None = Header(default=None),
+) -> dict[str, str]:
+    """浏览器使用 HTTP 头中的密码换取一次性短期 WebSocket 票据。"""
+    check_api_key(x_api_key)
+    return {"ticket": ui_tickets.issue()}
+
+
 @app.post("/api/devices/register")
 async def register_device(
     payload: dict = Body(...),
@@ -403,7 +600,9 @@ async def register_device(
         updated_devices = {**DEVICES, device_id: record}
         _write_devices(updated_devices)
         DEVICES[device_id] = record
-        return record.copy()
+        created_record = record.copy()
+    await publish_device_snapshot()
+    return created_record
 
 
 @app.get("/api/devices")
@@ -412,24 +611,7 @@ async def list_devices(
 ) -> list[dict[str, Any]]:
     check_api_key(x_api_key)
     async with device_lock:
-        # 在线设备在列表接口中报告「当前仍活跃」，但不因每次轮询写盘；
-        # 离线设备保留上次持久化的时间戳。
-        # latency_ms 为服务器↔Agent 的应用层 RTT（后台探测缓存）；离线为 null。
-        any_online = any(device_id in agents.websockets for device_id in DEVICES)
-        now = _now() if any_online else None
-        result: list[dict[str, Any]] = []
-        for device_id, record in sorted(DEVICES.items()):
-            online = device_id in agents.websockets
-            latency = agents.latency_ms.get(device_id) if online else None
-            result.append(
-                {
-                    **record,
-                    "last_active": now if online else record["last_active"],
-                    "online": online,
-                    "latency_ms": latency,
-                }
-            )
-        return result
+        return _device_records_locked()
 
 
 @app.delete("/api/devices/{device_id}")
@@ -447,6 +629,7 @@ async def delete_device(
         _write_devices(updated_devices)
         DEVICES.pop(normalized_device_id)
         await agents.remove(normalized_device_id)
+    await publish_device_snapshot()
     return {"ok": True}
 
 
@@ -499,6 +682,7 @@ async def websocket_agent(websocket: WebSocket) -> None:
             return
         await agents.connect(device_id, websocket)
         _update_last_active(device_id)
+    await publish_device_snapshot()
     # 连接建立后尽快测一次 RTT，不必等后台周期。
     asyncio.create_task(agents.measure_latency(device_id), name=f"latency-{device_id}")
     try:
@@ -510,3 +694,25 @@ async def websocket_agent(websocket: WebSocket) -> None:
         async with device_lock:
             if agents.disconnect(device_id, websocket):
                 _update_last_active(device_id)
+                disconnected = True
+            else:
+                disconnected = False
+        if disconnected:
+            await publish_device_snapshot()
+
+
+@app.websocket("/ws/ui")
+async def websocket_ui(websocket: WebSocket) -> None:
+    """同源浏览器通过一次性短期票据订阅设备全量快照。"""
+    if not ui_tickets.consume(websocket.query_params.get("ticket")):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    client = await ui_clients.connect(websocket, device_snapshot)
+    if client is None:
+        return
+    try:
+        while True:
+            # 浏览器无需发送业务消息；持续 receive 用于感知断开并回收发送协程。
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await ui_clients.disconnect(client)

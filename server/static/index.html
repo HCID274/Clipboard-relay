@@ -616,8 +616,11 @@
       let devices = [];
       let target = localStorage.getItem(TARGET_STORAGE_KEY) || "";
       let targetOpen = false;
-      const STATUS_POLL_INTERVAL_MS = 4000;
-      let latestConnectionStatusRequestId = 0;
+      let uiSocket = null;
+      let uiReconnectTimer = null;
+      let passwordReconnectTimer = null;
+      let latestUiConnectionId = 0;
+      let latestSnapshotVersion = -1;
 
       const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
       if (savedKey) apiKeyInput.value = savedKey;
@@ -723,7 +726,6 @@
                 throw new Error(payload.detail || "HTTP " + response.status);
               }
               setStatus("设备 " + d.device_id + " 已删除。", "ok");
-              await refreshConnectionStatus();
             } catch (error) {
               setStatus("删除失败：" + error.message, "bad");
               del.disabled = false;
@@ -758,32 +760,55 @@
         apiKeyInput.value = "";
         apiKeyInput.focus();
         setStatus("密码已清除。", "");
-        refreshConnectionStatus();
+        scheduleUiConnection();
       });
 
-      apiKeyInput.addEventListener("change", () => {
-        refreshConnectionStatus();
+      apiKeyInput.addEventListener("input", () => {
+        window.clearTimeout(passwordReconnectTimer);
+        passwordReconnectTimer = window.setTimeout(scheduleUiConnection, 250);
       });
 
-      async function refreshConnectionStatus() {
-        const requestId = ++latestConnectionStatusRequestId;
+      function closeUiSocket() {
+        if (uiSocket) {
+          const socket = uiSocket;
+          uiSocket = null;
+          socket.close();
+        }
+      }
+
+      function resetDevices() {
+        devices = [];
+        latestSnapshotVersion = -1;
+        render();
+      }
+
+      function scheduleUiConnection(delay = 0) {
+        const connectionId = ++latestUiConnectionId;
+        window.clearTimeout(uiReconnectTimer);
+        closeUiSocket();
+        uiReconnectTimer = window.setTimeout(() => {
+          connectUi(connectionId);
+        }, delay);
+      }
+
+      async function connectUi(connectionId) {
         const apiKey = apiKeyInput.value.trim();
         if (!apiKey) {
-          devices = [];
-          render();
+          resetDevices();
           return;
         }
 
         try {
-          const response = await fetch("/api/devices", {
+          // 浏览器不能为 WebSocket 设置 X-API-Key，因此先用 HTTP 头换取短期一次性票据。
+          const response = await fetch("/api/ui-ticket", {
+            method: "POST",
             headers: { "X-API-Key": apiKey },
           });
 
-          if (requestId !== latestConnectionStatusRequestId) return;
+          if (connectionId !== latestUiConnectionId) return;
 
           if (response.status === 401) {
-            devices = [];
-            render();
+            resetDevices();
             setStatus("密码错误。", "bad");
             return;
           }
@@ -797,14 +822,47 @@
           }
 
           const payload = await response.json();
-          if (!Array.isArray(payload)) throw new Error("invalid status payload");
-          if (requestId !== latestConnectionStatusRequestId) return;
+          if (!payload || typeof payload.ticket !== "string") throw new Error("invalid ticket payload");
+          if (connectionId !== latestUiConnectionId) return;
 
-          devices = payload;
-          render();
+          const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+          // 服务端重启后快照版本会重新从较小值开始，因此每个新 UI 连接都重新建立版本基线。
+          latestSnapshotVersion = -1;
+          const socket = new WebSocket(
+            scheme + "//" + window.location.host + "/ws/ui?ticket=" + encodeURIComponent(payload.ticket)
+          );
+          uiSocket = socket;
+          socket.addEventListener("message", (event) => {
+            // 旧连接在关闭后仍可能排队触发消息事件，旧连接的数据不能影响新连接的版本基线。
+            if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
+            let snapshot;
+            try {
+              snapshot = JSON.parse(event.data);
+            } catch (_error) {
+              return;
+            }
+            if (
+              snapshot.type !== "devices_snapshot" ||
+              !Number.isInteger(snapshot.version) ||
+              !Array.isArray(snapshot.devices) ||
+              snapshot.version < latestSnapshotVersion
+            ) {
+              return;
+            }
+            latestSnapshotVersion = snapshot.version;
+            devices = snapshot.devices;
+            render();
+          });
+          socket.addEventListener("close", () => {
+            if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
+            uiSocket = null;
+            // 票据是一次性的，因此每次断线都重新通过同源 HTTP 获取票据再连接。
+            scheduleUiConnection(1000);
+          });
         } catch (error) {
-          if (requestId === latestConnectionStatusRequestId) {
+          if (connectionId === latestUiConnectionId) {
             setStatus("网络连接失败。", "bad");
+            scheduleUiConnection(1000);
           }
         }
       }
@@ -861,8 +919,7 @@
       });
 
       render();
-      refreshConnectionStatus();
-      window.setInterval(refreshConnectionStatus, STATUS_POLL_INTERVAL_MS);
+      scheduleUiConnection();
     </script>
 
 
