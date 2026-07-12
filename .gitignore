@@ -6,6 +6,10 @@
 __pycache__/
 *.pyc
 
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
+
 # Server runtime state
 /server/devices.json
 
