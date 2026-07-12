@@ -183,6 +183,12 @@ def _normalize_device_id(value: Any) -> str:
     return device_id
 
 
+async def reject_websocket(websocket: WebSocket) -> None:
+    """在 WebSocket 握手完成后关闭被拒绝的连接，避免未 accept 就 close。"""
+    await websocket.accept()
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+
+
 # 应用层 RTT：服务端发 ping、Agent 回 pong；列表接口返回缓存的 latency_ms。
 # 探测周期和超时均保持在一秒以内，以便半开连接不会长期显示为在线。
 LATENCY_PROBE_INTERVAL_SECONDS = 0.75
@@ -669,16 +675,16 @@ async def connection_status(
 async def websocket_agent(websocket: WebSocket) -> None:
     api_key = websocket.headers.get("x-api-key")
     if not _auth_configured() or not _credential_matches(api_key):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await reject_websocket(websocket)
         return
     try:
         device_id = _normalize_device_id(websocket.query_params.get("device_id"))
     except HTTPException:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await reject_websocket(websocket)
         return
     async with device_lock:
         if device_id not in DEVICES:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            await reject_websocket(websocket)
             return
         await agents.connect(device_id, websocket)
         _update_last_active(device_id)
@@ -705,7 +711,7 @@ async def websocket_agent(websocket: WebSocket) -> None:
 async def websocket_ui(websocket: WebSocket) -> None:
     """同源浏览器通过一次性短期票据订阅设备全量快照。"""
     if not ui_tickets.consume(websocket.query_params.get("ticket")):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await reject_websocket(websocket)
         return
     client = await ui_clients.connect(websocket, device_snapshot)
     if client is None:

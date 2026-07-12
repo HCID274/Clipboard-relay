@@ -219,10 +219,46 @@ def test_websocket_rejects_unregistered_device(client: TestClient) -> None:
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with client.websocket_connect(
             "/ws/agent?device_id=unknown-device", headers=headers()
-        ):
-            pass
+        ) as websocket:
+            websocket.receive_text()
 
     assert exc_info.value.code == 1008
+
+
+@pytest.mark.parametrize(
+    ("headers", "query_params"),
+    [
+        ({"x-api-key": "wrong-password"}, {"device_id": "mac-china"}),
+        ({"x-api-key": NEW_PASSWORD}, {"device_id": "invalid device"}),
+        ({"x-api-key": NEW_PASSWORD}, {"device_id": "unknown-device"}),
+    ],
+)
+def test_agent_rejections_accept_before_closing(
+    headers: dict[str, str], query_params: dict[str, str]
+) -> None:
+    """拒绝连接必须先完成握手，避免 Starlette 在 close 时抛出运行时错误。"""
+
+    class HandshakeCheckingWebSocket:
+        def __init__(self) -> None:
+            self.headers = headers
+            self.query_params = query_params
+            self.accepted = False
+            self.close_codes: list[int] = []
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def close(self, code: int) -> None:
+            if not self.accepted:
+                raise RuntimeError("WebSocket is not connected. Need to call accept first.")
+            self.close_codes.append(code)
+
+    websocket = HandshakeCheckingWebSocket()
+
+    asyncio.run(relay_app.websocket_agent(websocket))
+
+    assert websocket.accepted is True
+    assert websocket.close_codes == [1008]
 
 
 def test_delete_cannot_race_between_websocket_registration_check_and_connect() -> None:

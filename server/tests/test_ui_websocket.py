@@ -62,8 +62,8 @@ def test_ui_ticket_authentication_and_initial_snapshot(client: TestClient) -> No
 
     assert client.post("/api/ui-ticket", headers=headers("wrong")).status_code == 401
     with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect("/ws/ui?ticket=not-a-ticket"):
-            pass
+        with client.websocket_connect("/ws/ui?ticket=not-a-ticket") as websocket:
+            websocket.receive_text()
     assert exc_info.value.code == 1008
 
     ticket = issue_ticket(client)
@@ -82,9 +82,35 @@ def test_ui_ticket_authentication_and_initial_snapshot(client: TestClient) -> No
         ],
     }
     with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(f"/ws/ui?ticket={ticket}"):
-            pass
+        with client.websocket_connect(f"/ws/ui?ticket={ticket}") as websocket:
+            websocket.receive_text()
     assert exc_info.value.code == 1008
+
+
+def test_ui_rejection_accepts_before_closing() -> None:
+    """无效票据的拒绝流程必须先完成握手，避免 close 触发运行时错误。"""
+
+    class HandshakeCheckingWebSocket:
+        query_params = {"ticket": "invalid-ticket"}
+
+        def __init__(self) -> None:
+            self.accepted = False
+            self.close_codes: list[int] = []
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def close(self, code: int) -> None:
+            if not self.accepted:
+                raise RuntimeError("WebSocket is not connected. Need to call accept first.")
+            self.close_codes.append(code)
+
+    websocket = HandshakeCheckingWebSocket()
+
+    asyncio.run(relay_app.websocket_ui(websocket))
+
+    assert websocket.accepted is True
+    assert websocket.close_codes == [1008]
 
 
 def test_ui_subscription_serializes_initial_snapshot_with_publish() -> None:
