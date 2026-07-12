@@ -234,6 +234,16 @@ def on_open(ws_app: websocket.WebSocketApp) -> None:
     logging.info("connected to %s", ws_app.url)
 
 
+def build_pong_reply(payload: dict[str, Any]) -> dict[str, Any]:
+    """由服务端 ping 构造 pong 载荷，供测服务器↔本机 RTT。"""
+    reply: dict[str, Any] = {"type": "pong"}
+    if "t" in payload:
+        reply["t"] = payload["t"]
+    if "id" in payload:
+        reply["id"] = payload["id"]
+    return reply
+
+
 def on_message(ws_app: websocket.WebSocketApp, message: str) -> None:
     try:
         payload = json.loads(message)
@@ -245,7 +255,15 @@ def on_message(ws_app: websocket.WebSocketApp, message: str) -> None:
         logging.warning("ignored non-object JSON message")
         return
 
-    if payload.get("type") != "clipboard":
+    message_type = payload.get("type")
+    if message_type == "ping":
+        try:
+            ws_app.send(json.dumps(build_pong_reply(payload), ensure_ascii=True))
+        except Exception:
+            logging.exception("failed to send pong")
+        return
+
+    if message_type != "clipboard":
         logging.warning("ignored message with unsupported type")
         return
 

@@ -242,38 +242,62 @@ def update_status(
 
 
 def handle_message(
-    message: str,
+    message: str | bytes,
     *,
     copy_text: Callable[[str], None] = pyperclip.copy,
     logger: logging.Logger | None = None,
-) -> None:
+) -> dict[str, Any] | None:
+    """处理服务端下行消息。
+
+    * ``clipboard``：写入系统剪贴板。
+    * ``ping``：返回 ``pong`` 载荷，供调用方立刻回传以测服务器↔本机 RTT。
+    其它类型忽略。返回值非 None 时表示需要经 WebSocket 发回服务端。
+    """
     active_logger = logger or logging.getLogger(LOGGER_NAME)
+
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError:
+            active_logger.warning("ignored non-utf8 message")
+            return None
 
     try:
         payload: Any = json.loads(message)
     except json.JSONDecodeError:
         active_logger.warning("ignored invalid JSON message")
-        return
+        return None
 
     if not isinstance(payload, dict):
         active_logger.warning("ignored non-object JSON message")
-        return
+        return None
 
-    if payload.get("type") != "clipboard":
-        return
+    message_type = payload.get("type")
+    if message_type == "ping":
+        # 原样回传服务端带的 t，便于对账；RTT 以服务端本地时钟为准。
+        reply: dict[str, Any] = {"type": "pong"}
+        if "t" in payload:
+            reply["t"] = payload["t"]
+        if "id" in payload:
+            reply["id"] = payload["id"]
+        return reply
+
+    if message_type != "clipboard":
+        return None
 
     text = payload.get("text")
     if not isinstance(text, str):
         active_logger.warning("ignored clipboard message: clipboard text is not a string")
-        return
+        return None
 
     try:
         copy_text(text)
     except Exception:
         active_logger.exception("failed to write clipboard")
-        return
+        return None
 
     active_logger.info("clipboard updated length=%s", len(text))
+    return None
 
 
 def configure_logging(log_path: Path = LOG_PATH) -> logging.Logger:
@@ -317,8 +341,13 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
                 reconnect_attempts=current_reconnect_attempts,
             )
 
-        def on_message(_ws: websocket.WebSocketApp, msg: str) -> None:
-            handle_message(msg, logger=logger)
+        def on_message(ws_app: websocket.WebSocketApp, msg: str) -> None:
+            reply = handle_message(msg, logger=logger)
+            if reply is not None:
+                try:
+                    ws_app.send(json.dumps(reply, ensure_ascii=True))
+                except Exception:
+                    logger.exception("failed to send pong")
             update_status(
                 server_ws_url=websocket_url,
                 connected=True,

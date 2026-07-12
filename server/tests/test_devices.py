@@ -31,9 +31,13 @@ def reset_server_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(relay_app, "device_lock", asyncio.Lock())
     relay_app.DEVICES.clear()
     relay_app.agents.websockets.clear()
+    relay_app.agents.latency_ms.clear()
+    relay_app.agents._pending_pings.clear()
     yield
     relay_app.DEVICES.clear()
     relay_app.agents.websockets.clear()
+    relay_app.agents.latency_ms.clear()
+    relay_app.agents._pending_pings.clear()
 
 
 @pytest.fixture
@@ -205,6 +209,7 @@ def test_list_merges_persistent_records_with_online_state(
                 "created_at": INITIAL_TIMESTAMP,
                 "last_active": "2026-07-11T02:00:00Z",
                 "online": True,
+                "latency_ms": None,
             }
         ]
         assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
@@ -266,11 +271,24 @@ def test_delete_closes_online_device_and_removes_record(client: TestClient) -> N
     with client.websocket_connect(
         "/ws/agent?device_id=mac-china", headers=headers()
     ) as websocket:
+        # 连接后服务端可能先下发 latency ping；先排空非关闭帧。
+        while True:
+            try:
+                message = websocket.receive_json()
+            except WebSocketDisconnect as exc:
+                # 尚未 delete 就断开则失败
+                raise AssertionError(f"unexpected disconnect: {exc.code}") from exc
+            if isinstance(message, dict) and message.get("type") == "ping":
+                websocket.send_json({"type": "pong", "t": message.get("t")})
+                break
+            break
+
         response = client.delete("/api/devices/mac-china", headers=headers())
 
         assert response.status_code == 200
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            websocket.receive_text()
+            while True:
+                websocket.receive_text()
         assert exc_info.value.code == 1000
 
     assert "mac-china" not in relay_app.DEVICES
@@ -320,6 +338,7 @@ def test_last_active_updates_on_connect_and_disconnect(
             "created_at": "2026-07-11T01:00:00Z",
             "last_active": "2026-07-11T01:00:00Z",
             "online": False,
+            "latency_ms": None,
         }
     ]
 
@@ -368,6 +387,201 @@ def test_list_online_last_active_is_fresh_without_disk_write(
         assert first["last_active"] == "2026-07-11T02:00:00Z"
         assert second["last_active"] == "2026-07-11T03:00:00Z"
         assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
+
+
+def test_list_devices_includes_cached_latency_ms(client: TestClient) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    relay_app.DEVICES["win-fukuoka"] = record("win-fukuoka")
+    relay_app.agents.websockets["mac-china"] = object()  # type: ignore[assignment]
+    relay_app.agents.latency_ms["mac-china"] = 42
+
+    response = client.get("/api/devices", headers=headers())
+
+    assert response.status_code == 200
+    by_id = {item["device_id"]: item for item in response.json()}
+    assert by_id["mac-china"]["online"] is True
+    assert by_id["mac-china"]["latency_ms"] == 42
+    assert by_id["win-fukuoka"]["online"] is False
+    assert by_id["win-fukuoka"]["latency_ms"] is None
+
+
+def test_measure_latency_records_rtt_when_agent_pongs() -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+            # 模拟 Agent 立刻回匹配的 pong（含 probe id）。
+            relay_app.agents.handle_agent_text(
+                "mac-china",
+                json.dumps(
+                    {
+                        "type": "pong",
+                        "id": payload.get("id"),
+                        "t": payload.get("t"),
+                    }
+                ),
+                self,  # type: ignore[arg-type]
+            )
+
+    async def run() -> int | None:
+        fake = FakeWebSocket()
+        relay_app.agents.websockets["mac-china"] = fake  # type: ignore[assignment]
+        return await relay_app.agents.measure_latency("mac-china", timeout=1.0)
+
+    ms = asyncio.run(run())
+
+    assert isinstance(ms, int)
+    assert ms >= 0
+    assert relay_app.agents.latency_ms["mac-china"] == ms
+
+
+def test_measure_latency_ignores_mismatched_or_stale_pong() -> None:
+    class CapturingWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    async def run() -> int | None:
+        fake = CapturingWebSocket()
+        relay_app.agents.websockets["mac-china"] = fake  # type: ignore[assignment]
+        task = asyncio.create_task(
+            relay_app.agents.measure_latency("mac-china", timeout=0.2)
+        )
+        await asyncio.sleep(0)
+        assert fake.sent and fake.sent[0]["type"] == "ping"
+        probe_id = fake.sent[0]["id"]
+        # 错误 id / 任意 pong 不得完成探测。
+        relay_app.agents.handle_agent_text(
+            "mac-china",
+            json.dumps({"type": "pong", "id": "not-the-current-probe", "t": -1}),
+            fake,  # type: ignore[arg-type]
+        )
+        # 旧连接对象的迟到 pong 也不得完成。
+        stale = CapturingWebSocket()
+        relay_app.agents.handle_agent_text(
+            "mac-china",
+            json.dumps({"type": "pong", "id": probe_id, "t": fake.sent[0]["t"]}),
+            stale,  # type: ignore[arg-type]
+        )
+        return await task
+
+    ms = asyncio.run(run())
+
+    assert ms is None
+    assert relay_app.agents.latency_ms["mac-china"] is None
+
+
+def test_stale_connection_pong_cannot_complete_new_session_probe() -> None:
+    class CapturingWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    async def run() -> int | None:
+        old_ws = CapturingWebSocket()
+        new_ws = CapturingWebSocket()
+        relay_app.agents.websockets["mac-china"] = old_ws  # type: ignore[assignment]
+        task = asyncio.create_task(
+            relay_app.agents.measure_latency("mac-china", timeout=0.25)
+        )
+        await asyncio.sleep(0)
+        # 模拟同名设备重连：表项换成 new_ws，并取消旧探测语义由 connect 负责；
+        # 此处只验证 handle 侧：旧 socket 的 pong 在表项已是 new 时被忽略。
+        relay_app.agents.websockets["mac-china"] = new_ws  # type: ignore[assignment]
+        old_probe = old_ws.sent[0]
+        relay_app.agents.handle_agent_text(
+            "mac-china",
+            json.dumps(
+                {
+                    "type": "pong",
+                    "id": old_probe["id"],
+                    "t": old_probe["t"],
+                }
+            ),
+            old_ws,  # type: ignore[arg-type]
+        )
+        return await task
+
+    ms = asyncio.run(run())
+
+    assert ms is None
+
+
+def test_connect_cancels_pending_before_closing_old_socket() -> None:
+    """重连时 close 旧 socket 让出执行权，旧 pong 也不得完成旧探测。"""
+
+    class CapturingWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+            self.closed = False
+            self.close_started = asyncio.Event()
+            self.allow_close = asyncio.Event()
+
+        async def accept(self) -> None:
+            return None
+
+        async def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+        async def close(self, code: int = 1000) -> None:
+            self.close_started.set()
+            await self.allow_close.wait()
+            self.closed = True
+
+    async def run() -> tuple[int | None, bool]:
+        old_ws = CapturingWebSocket()
+        new_ws = CapturingWebSocket()
+        relay_app.agents.websockets["mac-china"] = old_ws  # type: ignore[assignment]
+        measure_task = asyncio.create_task(
+            relay_app.agents.measure_latency("mac-china", timeout=1.0)
+        )
+        await asyncio.sleep(0)
+        assert old_ws.sent and "id" in old_ws.sent[0]
+        probe = old_ws.sent[0]
+
+        connect_task = asyncio.create_task(
+            relay_app.agents.connect("mac-china", new_ws)  # type: ignore[arg-type]
+        )
+        await old_ws.close_started.wait()
+        # 此时 connect 应已取消 pending 并切换表项，再 await close。
+        assert relay_app.agents.websockets["mac-china"] is new_ws
+        relay_app.agents.handle_agent_text(
+            "mac-china",
+            json.dumps(
+                {"type": "pong", "id": probe["id"], "t": probe["t"]}
+            ),
+            old_ws,  # type: ignore[arg-type]
+        )
+        old_ws.allow_close.set()
+        await connect_task
+        ms = await measure_task
+        return ms, old_ws.closed
+
+    ms, closed = asyncio.run(run())
+
+    assert closed is True
+    assert ms is None
+
+
+def test_measure_latency_times_out_without_pong() -> None:
+    class SilentWebSocket:
+        async def send_json(self, payload: dict) -> None:
+            return None
+
+    async def run() -> int | None:
+        relay_app.agents.websockets["mac-china"] = SilentWebSocket()  # type: ignore[assignment]
+        return await relay_app.agents.measure_latency("mac-china", timeout=0.05)
+
+    ms = asyncio.run(run())
+
+    assert ms is None
+    assert relay_app.agents.latency_ms["mac-china"] is None
 
 
 def test_send_failure_closes_connection_and_updates_offline_state(

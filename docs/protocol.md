@@ -66,10 +66,15 @@ HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
     "device_id": "win-fukuoka",
     "created_at": "2026-07-11T00:00:00Z",
     "last_active": "2026-07-11T00:00:00Z",
-    "online": true
+    "online": true,
+    "latency_ms": 48
   }
 ]
 ```
+
+`latency_ms` 是**服务器到该 Agent** 的应用层往返时延（毫秒）。服务端定期向在线
+Agent 发送 `{"type":"ping"}`，Agent 立即回复 `{"type":"pong"}`；列表接口返回最近一次
+成功测得的缓存值。离线设备、尚未测到或测速超时的设备为 `null`。该字段**不写盘**。
 
 ### `DELETE /api/devices/{device_id}`
 
@@ -102,10 +107,21 @@ wss://clip.hcid274.cn/ws/agent?device_id=<已注册设备 ID>
 {"type":"clipboard","text":"..."}
 ```
 
-WebSocket 连接成功（accept 且设备已注册）后，服务端立即更新并持久化该设备的 `last_active`。
-服务端通过 `receive_text()` 检测断线。只有当前有效连接断开时，服务端才会移除内存连接并再次
-更新该设备的 `last_active`；被同名新连接替换的旧连接不会覆盖当前状态（包括新连接写入的
-`last_active`）。
+RTT 探测（服务端 → Agent → 服务端）：
+
+```json
+{"type":"ping","id":"<probe-uuid>","t":<服务器 monotonic 时间戳>}
+{"type":"pong","id":"<probe-uuid>","t":<原样回传>}
+```
+
+Agent 收到 `ping` 后应立即回复 `pong`，并**原样回传** `id` 与 `t`，不要写入剪贴板。
+服务端只接受同时满足下列条件的 `pong`：来自该 `device_id` 的**当前** WebSocket、
+且 `id` 与本次探测一致。错误 / 迟到 / 旧连接的 `pong` 一律忽略。
+
+WebSocket 连接成功（accept 且设备已注册）后，服务端立即更新并持久化该设备的 `last_active`，
+并尽快发起一次延迟探测。服务端通过 `receive_text()` 消费 Agent 上行（含 `pong`）并检测断线。
+只有当前有效连接断开时，服务端才会移除内存连接并再次更新该设备的 `last_active`；被同名新连接
+替换的旧连接不会覆盖当前状态（包括新连接写入的 `last_active`）。
 
 ## Agent 首次配置
 

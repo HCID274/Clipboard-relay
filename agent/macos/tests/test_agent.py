@@ -307,13 +307,27 @@ def test_handle_message_ignores_invalid_json(caplog) -> None:
 def test_handle_message_ignores_non_clipboard_type() -> None:
     copied = []
 
-    handle_message(
-        '{"type":"ping","text":"hello"}',
+    reply = handle_message(
+        '{"type":"status","text":"hello"}',
         copy_text=copied.append,
         logger=logging.getLogger("test.clipboard"),
     )
 
     assert copied == []
+    assert reply is None
+
+
+def test_handle_message_ping_returns_pong_without_touching_clipboard() -> None:
+    copied = []
+
+    reply = handle_message(
+        '{"type":"ping","t":123.45,"id":"abc"}',
+        copy_text=copied.append,
+        logger=logging.getLogger("test.clipboard"),
+    )
+
+    assert copied == []
+    assert reply == {"type": "pong", "t": 123.45, "id": "abc"}
 
 
 def test_handle_message_ignores_non_string_text(caplog) -> None:

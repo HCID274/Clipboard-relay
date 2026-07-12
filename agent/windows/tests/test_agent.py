@@ -204,3 +204,11 @@ def test_clear_password_makes_the_installer_prompt_on_the_next_run(tmp_path) -> 
 
     assert agent.password_setup_status(config_path) == 0
     assert json.loads(config_path.read_text(encoding="utf-8"))["password"] == ""
+
+
+def test_build_pong_reply_echoes_ping_fields() -> None:
+    assert agent.build_pong_reply({"type": "ping", "t": 1.25, "id": "n1"}) == {
+        "type": "pong",
+        "t": 1.25,
+        "id": "n1",
+    }

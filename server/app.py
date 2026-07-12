@@ -4,6 +4,10 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -178,28 +182,66 @@ def _normalize_device_id(value: Any) -> str:
     return device_id
 
 
-app = FastAPI(title="Clipboard Relay")
+# 应用层 RTT：服务端发 ping、Agent 回 pong；列表接口返回缓存的 latency_ms。
+LATENCY_PROBE_INTERVAL_SECONDS = 3.0
+LATENCY_PROBE_TIMEOUT_SECONDS = 1.5
+
+
+@dataclass
+class _PendingPing:
+    """一次进行中的 RTT 探测：必须由「当前连接 + 匹配 probe_id」的 pong 完成。"""
+
+    future: asyncio.Future[None]
+    probe_id: str
+    websocket: WebSocket
 
 
 class AgentConnections:
+    """在线 Agent 的 WebSocket 连接表，以及每台设备最近一次测得的 RTT。"""
+
     def __init__(self) -> None:
         self.websockets: dict[str, WebSocket] = {}
+        # 最近一次成功 ping/pong 的往返毫秒数；离线或超时则为缺失/None。
+        self.latency_ms: dict[str, int | None] = {}
+        # 每台设备最多一个进行中的测速；键为 device_id。
+        self._pending_pings: dict[str, _PendingPing] = {}
+
+    def _cancel_pending(self, device_id: str) -> None:
+        pending = self._pending_pings.pop(device_id, None)
+        if pending is not None and not pending.future.done():
+            pending.future.cancel()
+
+    def _clear_latency_state(self, device_id: str) -> None:
+        self._cancel_pending(device_id)
+        self.latency_ms.pop(device_id, None)
 
     async def connect(self, device_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
         old_websocket = self.websockets.get(device_id)
-        if old_websocket is not None:
-            await old_websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        # 必须先作废探测并切换表项，再 await close 旧连接。
+        # 若先 close，await 让出期间旧连接的匹配 pong 仍可能完成旧探测。
+        self._clear_latency_state(device_id)
         self.websockets[device_id] = websocket
+        if old_websocket is not None and old_websocket is not websocket:
+            try:
+                await old_websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+            except Exception as close_error:
+                LOGGER.warning(
+                    "failed to close replaced agent websocket %s: %s",
+                    device_id,
+                    close_error,
+                )
 
     def disconnect(self, device_id: str, websocket: WebSocket) -> bool:
         if self.websockets.get(device_id) is not websocket:
             return False
         self.websockets.pop(device_id, None)
+        self._clear_latency_state(device_id)
         return True
 
     async def remove(self, device_id: str) -> None:
         websocket = self.websockets.pop(device_id, None)
+        self._clear_latency_state(device_id)
         if websocket is not None:
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
 
@@ -220,8 +262,113 @@ class AgentConnections:
                 )
             raise RuntimeError("agent offline")
 
+    def handle_agent_text(
+        self, device_id: str, raw: str, websocket: WebSocket
+    ) -> None:
+        """处理 Agent 上行文本；仅当 pong 来自当前连接且 probe_id 匹配时完成测速。"""
+        # 旧连接被替换后仍可能收到迟到帧：必须与当前表中的 socket 同一对象。
+        if self.websockets.get(device_id) is not websocket:
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict) or payload.get("type") != "pong":
+            return
+        pending = self._pending_pings.get(device_id)
+        if pending is None or pending.future.done():
+            return
+        if pending.websocket is not websocket:
+            return
+        if payload.get("id") != pending.probe_id:
+            return
+        pending.future.set_result(None)
+
+    async def measure_latency(
+        self,
+        device_id: str,
+        *,
+        timeout: float = LATENCY_PROBE_TIMEOUT_SECONDS,
+    ) -> int | None:
+        """对在线 Agent 发应用层 ping，等待匹配 pong，返回整毫秒 RTT；失败返回 None。"""
+        websocket = self.websockets.get(device_id)
+        if websocket is None:
+            self.latency_ms.pop(device_id, None)
+            return None
+
+        self._cancel_pending(device_id)
+
+        loop = asyncio.get_running_loop()
+        probe_id = uuid.uuid4().hex
+        sent_at = time.perf_counter()
+        pending = _PendingPing(
+            future=loop.create_future(),
+            probe_id=probe_id,
+            websocket=websocket,
+        )
+        self._pending_pings[device_id] = pending
+        try:
+            await websocket.send_json(
+                {"type": "ping", "id": probe_id, "t": sent_at}
+            )
+            await asyncio.wait_for(pending.future, timeout=timeout)
+            # 若测速过程中连接被替换，丢弃结果（避免把旧会话 RTT 记到新连接）。
+            if self.websockets.get(device_id) is not websocket:
+                self.latency_ms[device_id] = None
+                return None
+            ms = max(0, int(round((time.perf_counter() - sent_at) * 1000)))
+            self.latency_ms[device_id] = ms
+            return ms
+        except asyncio.CancelledError:
+            # 重连/删除取消了 pending.future 时，wait_for 会抛 CancelledError。
+            if self.websockets.get(device_id) is websocket:
+                self.latency_ms[device_id] = None
+            return None
+        except Exception:
+            # 超时、发送失败：不保留过期延迟，前端显示 "—"。
+            if self.websockets.get(device_id) is websocket:
+                self.latency_ms[device_id] = None
+            return None
+        finally:
+            if self._pending_pings.get(device_id) is pending:
+                self._pending_pings.pop(device_id, None)
+
 
 agents = AgentConnections()
+
+
+async def _latency_probe_loop() -> None:
+    """后台周期性探测所有在线 Agent 的服务器↔设备 RTT。"""
+    while True:
+        try:
+            await asyncio.sleep(LATENCY_PROBE_INTERVAL_SECONDS)
+            online_ids = list(agents.websockets)
+            if not online_ids:
+                continue
+            await asyncio.gather(
+                *(agents.measure_latency(device_id) for device_id in online_ids),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.warning("latency probe loop error: %s", error)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    probe_task = asyncio.create_task(_latency_probe_loop(), name="latency-probe")
+    try:
+        yield
+    finally:
+        probe_task.cancel()
+        try:
+            await probe_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Clipboard Relay", lifespan=lifespan)
 
 
 @app.get("/")
@@ -267,16 +414,19 @@ async def list_devices(
     async with device_lock:
         # 在线设备在列表接口中报告「当前仍活跃」，但不因每次轮询写盘；
         # 离线设备保留上次持久化的时间戳。
+        # latency_ms 为服务器↔Agent 的应用层 RTT（后台探测缓存）；离线为 null。
         any_online = any(device_id in agents.websockets for device_id in DEVICES)
         now = _now() if any_online else None
         result: list[dict[str, Any]] = []
         for device_id, record in sorted(DEVICES.items()):
             online = device_id in agents.websockets
+            latency = agents.latency_ms.get(device_id) if online else None
             result.append(
                 {
                     **record,
                     "last_active": now if online else record["last_active"],
                     "online": online,
+                    "latency_ms": latency,
                 }
             )
         return result
@@ -349,9 +499,13 @@ async def websocket_agent(websocket: WebSocket) -> None:
             return
         await agents.connect(device_id, websocket)
         _update_last_active(device_id)
+    # 连接建立后尽快测一次 RTT，不必等后台周期。
+    asyncio.create_task(agents.measure_latency(device_id), name=f"latency-{device_id}")
     try:
         while True:
-            await websocket.receive_text()
+            # 消费 Agent 上行（pong 等）；剪贴板只由服务端下发。
+            raw = await websocket.receive_text()
+            agents.handle_agent_text(device_id, raw, websocket)
     except WebSocketDisconnect:
         async with device_lock:
             if agents.disconnect(device_id, websocket):
