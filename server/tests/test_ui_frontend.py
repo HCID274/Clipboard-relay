@@ -42,3 +42,14 @@ def test_invalid_cached_password_is_cleared_and_send_does_not_persist_password()
     assert 'INVALID_CACHED_PASSWORD_MESSAGE = "保存的密码已失效，请重新验证。"' in page
     assert page.count("clearCachedPassword(INVALID_CACHED_PASSWORD_MESSAGE)") == 3
     assert "localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);" not in page[send_start:]
+
+
+def test_latency_only_refresh_does_not_rebuild_rows() -> None:
+    """纯 latency 刷新只改 ms 并 tick，不能每次快照都重建整行（否则会整行抖动）。"""
+    page = read_ui_page()
+    assert "function updateLatenciesOnly()" in page
+    assert "function structureKey()" in page
+    assert "latencyTick" in page
+    assert "updateLatenciesOnly();" in page
+    # 快照到达仍走 render，但结构未变时应 early-return 到 latency-only 路径
+    assert "lastStructureKey === key" in page

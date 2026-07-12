@@ -400,11 +400,14 @@
       .dot.online { background: #35c26b; box-shadow: 0 0 8px #35c26b; animation: pulseG 2.6s infinite; }
       .dot.offline { background: #e0a53b; }
 
-      .latency { font-family: "IBM Plex Mono", monospace; font-size: 12px; font-weight: 600; min-width: 44px; text-align: right; display: inline-block; transition: transform .28s cubic-bezier(.34,1.56,.64,1), color .3s; }
+      /* 仅 latency 数字做 tick 跳动；整行不要随每秒快照重播入场动画 */
+      .latency { font-family: "IBM Plex Mono", monospace; font-size: 12px; font-weight: 600; min-width: 44px; text-align: right; display: inline-block; transition: color .3s; font-variant-numeric: tabular-nums; }
       .latency.good { color: #35c26b; }
       .latency.mid { color: #e0a53b; }
       .latency.bad { color: #ef5350; }
       .latency.none { color: #5f656c; }
+      .latency.tick { animation: latencyTick .28s cubic-bezier(.34,1.56,.64,1); }
+      .latency.compact { min-width: 0; }
 
       .status-pill { font-size: 12px; font-weight: 700; }
       .status-pill.online { color: #35c26b; }
@@ -587,6 +590,11 @@
       @keyframes itemIn {
         from { opacity: 0; transform: translateY(6px) scale(.98); }
         to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @keyframes latencyTick {
+        0% { transform: scale(1); }
+        40% { transform: scale(1.16); }
+        100% { transform: scale(1); }
       }
       @keyframes popIn {
         0% { opacity: 0; transform: scale(.3) rotate(-20deg); }
@@ -802,7 +810,48 @@
         return ms == null ? "—" : ms + " ms";
       }
 
-      function render() {
+      // 设备增删/在线状态/选中目标变化才整表重建；纯 latency 刷新只改数字，避免整行 itemIn 抖动。
+      let lastStructureKey = null;
+
+      function structureKey() {
+        return devices
+          .map((d) => d.device_id + "\0" + (d.online ? "1" : "0"))
+          .join("\n") + "\n@" + target;
+      }
+
+      function setLatencyEl(el, ms, { animate = false, compact = false } = {}) {
+        if (!el) return;
+        const nextText = latencyText(ms);
+        const nextClass = "latency " + latencyClass(ms) + (compact ? " compact" : "");
+        const changed = el.textContent !== nextText || el.className.replace(/\s*tick\b/g, "") !== nextClass;
+        el.textContent = nextText;
+        el.className = nextClass;
+        if (animate && changed) {
+          el.classList.remove("tick");
+          // 强制重启动画，让每次 ms 变化都有轻微跳动
+          void el.offsetWidth;
+          el.classList.add("tick");
+        }
+      }
+
+      function updateLatenciesOnly() {
+        const dev = devices.find((d) => d.device_id === target);
+        setLatencyEl(selLatency, dev ? getLatencyMs(dev) : null, { animate: true });
+
+        devices.forEach((d) => {
+          const ms = getLatencyMs(d);
+          targetList.querySelectorAll('.picker-row[data-device-id="' + CSS.escape(d.device_id) + '"] .latency').forEach((el) => {
+            setLatencyEl(el, ms, { animate: true });
+          });
+          const sheetRow = deviceListEl.querySelector('.device-row[data-device-id="' + CSS.escape(d.device_id) + '"]');
+          if (!sheetRow) return;
+          setLatencyEl(sheetRow.querySelector(".latency"), ms, { animate: true, compact: true });
+          const meta = sheetRow.querySelector(".meta");
+          if (meta) meta.textContent = "最后活跃 · " + formatLastActive(d.last_active);
+        });
+      }
+
+      function render(force = false) {
         // header badge
         const onlineCount = devices.filter((d) => d.online).length;
         onlineBadge.textContent = onlineCount;
@@ -813,20 +862,26 @@
         }
         const dev = devices.find((d) => d.device_id === target);
 
-        // selected row summary
+        // selected row summary（非 latency 字段）
         selDot.className = "dot big" + (dev ? (dev.online ? " online" : " offline") : "");
         selName.textContent = dev ? dev.device_id : "未选择设备";
-        const ms = dev ? getLatencyMs(dev) : null;
-        selLatency.textContent = latencyText(ms);
-        selLatency.className = "latency " + latencyClass(ms);
         selPill.textContent = dev ? (dev.online ? "已连接" : "未连接") : "—";
         selPill.className = "status-pill " + (dev ? (dev.online ? "online" : "offline") : "none");
+        sheetMeta.textContent = devices.length + " 台 · " + onlineCount + " 在线";
 
-        // picker list
+        const key = structureKey();
+        if (!force && lastStructureKey === key && targetList.children.length === devices.length) {
+          updateLatenciesOnly();
+          return;
+        }
+        lastStructureKey = key;
+
+        // 结构变化：重建列表（此时允许 itemIn 入场一次）
         targetList.innerHTML = "";
         devices.forEach((d) => {
           const row = document.createElement("button");
           row.type = "button";
+          row.dataset.deviceId = d.device_id;
           row.className = "picker-row" + (d.device_id === target ? " selected" : "");
           const dms = getLatencyMs(d);
           row.innerHTML =
@@ -839,17 +894,17 @@
             localStorage.setItem(TARGET_STORAGE_KEY, target);
             targetOpen = false;
             updateTargetOpenUI();
-            render();
+            render(true);
           });
           targetList.appendChild(row);
         });
+        setLatencyEl(selLatency, dev ? getLatencyMs(dev) : null, { animate: false });
 
-        // manage sheet list
-        sheetMeta.textContent = devices.length + " 台 · " + onlineCount + " 在线";
         deviceListEl.innerHTML = "";
         devices.forEach((d) => {
           const row = document.createElement("div");
           row.className = "device-row";
+          row.dataset.deviceId = d.device_id;
           const dms = getLatencyMs(d);
           row.innerHTML =
             '<span class="dot' + (d.online ? " online" : " offline") + '"></span>' +
@@ -857,7 +912,7 @@
               '<div class="name-row">' +
                 '<span class="name">' + d.device_id + "</span>" +
                 '<span class="status-text ' + (d.online ? "online" : "offline") + '">' + (d.online ? "在线" : "离线") + "</span>" +
-                '<span class="latency ' + latencyClass(dms) + '" style="min-width:0">' + latencyText(dms) + "</span>" +
+                '<span class="latency compact ' + latencyClass(dms) + '">' + latencyText(dms) + "</span>" +
               "</div>" +
               '<div class="meta">最后活跃 · ' + formatLastActive(d.last_active) + "</div>" +
             "</div>";
