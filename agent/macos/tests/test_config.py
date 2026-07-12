@@ -5,6 +5,7 @@ import pytest
 
 from clipboard_relay_agent.config import (
     ConfigError,
+    clear_password,
     config_needs_password,
     load_config,
     save_device_id,
@@ -122,6 +123,51 @@ def test_password_setup_replaces_placeholder_and_preserves_config(tmp_path: Path
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["password"] == "new-secret"
     assert saved["reconnect_seconds"] == 7
+
+
+def test_clear_password_makes_installer_prompt_on_the_next_run(tmp_path: Path) -> None:
+    """401 后清密码：下次安装应重新认为需要输入密码。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "device_id": "mac-office",
+                "reconnect_seconds": 7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    clear_password(config_path)
+
+    assert config_needs_password(config_path) is True
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["password"] == ""
+    assert saved["device_id"] == "mac-office"
+    assert saved["reconnect_seconds"] == 7
+
+
+def test_clear_password_also_clears_legacy_api_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "api_key": "legacy-key",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    clear_password(config_path)
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["password"] == ""
+    assert saved["api_key"] == ""
+    assert config_needs_password(config_path) is True
 
 
 def test_save_device_id_preserves_config_and_persists_normalized_identity(tmp_path: Path) -> None:

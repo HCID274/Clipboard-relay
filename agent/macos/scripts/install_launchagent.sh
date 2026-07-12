@@ -75,7 +75,31 @@ elif [[ $password_status -ne 1 ]]; then
   exit "$password_status"
 fi
 
+set +e
 "$PROJECT_DIR/.venv/bin/python" -m clipboard_relay_agent --config "$CONFIG_PATH" --register-only
+register_status=$?
+set -e
+
+# 与 Windows install_task.cmd 一致：exit 3 = 密码被拒（Agent 侧已尽量清密码，此处再清一次幂等兜底）
+if [[ $register_status -eq 3 ]]; then
+  "$PROJECT_DIR/.venv/bin/python" - "$CONFIG_PATH" <<'PY'
+import sys
+from pathlib import Path
+
+from clipboard_relay_agent.config import ConfigError, clear_password
+
+try:
+    clear_password(Path(sys.argv[1]))
+except ConfigError as exc:
+    print(f"Cannot clear rejected password: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+  echo "共享密码被服务器拒绝，已从本地配置清除。请重新运行本脚本并输入正确密码。" >&2
+  exit 1
+fi
+if [[ $register_status -ne 0 ]]; then
+  exit "$register_status"
+fi
 
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

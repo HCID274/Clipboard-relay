@@ -25,6 +25,7 @@ from clipboard_relay_agent.config import (
     DEFAULT_CONFIG_PATH,
     Config,
     ConfigError,
+    clear_password,
     load_config,
     save_device_id,
 )
@@ -61,6 +62,8 @@ PING_TIMEOUT_SECONDS = 10
 CONNECT_TIMEOUT_SECONDS = 8
 LOG_MAX_BYTES = 1_048_576
 LOG_BACKUP_COUNT = 3
+# 与 Windows Agent 一致：安装脚本用此退出码识别「密码错误并已/应清本地密码」。
+AUTHENTICATION_FAILURE_EXIT_CODE = 3
 STATIC_HOST_IPS = {
     "clip.hcid274.cn": "64.176.40.67",
 }
@@ -68,6 +71,10 @@ STATIC_HOST_IPS = {
 
 class RegistrationError(RuntimeError):
     """服务端拒绝或无法完成设备注册时抛出。"""
+
+
+class AuthenticationError(RegistrationError):
+    """共享密码校验失败（HTTP 401）时抛出。"""
 
 
 class StaticAddressHTTPSConnection(http.client.HTTPSConnection):
@@ -120,7 +127,9 @@ def _registration_error(status_code: int, reason: str, body: bytes) -> Registrat
         detail = json.loads(body.decode("utf-8")).get("detail", reason)
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
         detail = reason
-    return RegistrationError(f"设备注册失败（HTTP {status_code}）：{detail}")
+    # 401 单独成类，便于 main/安装脚本清本地密码并提示重输。
+    error_type = AuthenticationError if status_code == 401 else RegistrationError
+    return error_type(f"设备注册失败（HTTP {status_code}）：{detail}")
 
 
 def send_registration_request(
@@ -390,6 +399,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         config = register_configured_device(config, args.config)
+    except AuthenticationError as exc:
+        # 密码错误：清空本地密码，避免 LaunchAgent 用错误凭据无限重试。
+        logger.error("%s", exc)
+        print(str(exc), file=sys.stderr)
+        try:
+            clear_password(args.config)
+            print(
+                "共享密码被服务器拒绝，已从本地配置清除；"
+                "请重新运行安装脚本并输入正确密码。",
+                file=sys.stderr,
+            )
+        except ConfigError as clear_exc:
+            logger.error("failed to clear rejected password: %s", clear_exc)
+        return AUTHENTICATION_FAILURE_EXIT_CODE
     except (ConfigError, RegistrationError) as exc:
         logger.error("%s", exc)
         print(str(exc), file=sys.stderr)

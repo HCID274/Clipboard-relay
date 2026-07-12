@@ -82,6 +82,20 @@ def set_password(path: Path, password: str) -> None:
     _write_config(path, raw)
 
 
+def clear_password(path: Path) -> None:
+    """清空本地共享密码，使下次安装脚本重新提示输入。
+
+    与 Windows Agent 行为对齐：服务端 401（密码错误）后应调用本函数，
+    避免错误密码一直留在配置里导致 KeepAlive / 重装静默重试。
+    """
+    raw = _load_raw_config(path)
+    raw["password"] = ""
+    # 兼容仍使用 api_key 字段的旧配置，一并清空。
+    if "api_key" in raw:
+        raw["api_key"] = ""
+    _write_config(path, raw)
+
+
 def validate_password(value: Any, key: str = "password") -> str:
     password = _required_string({key: value}, key).strip()
     if not password.isascii():

@@ -1,13 +1,19 @@
-import logging
+import io
 import json
+import logging
 from logging.handlers import RotatingFileHandler
+from urllib.error import HTTPError
 
 import clipboard_relay_agent.agent as agent_module
 from clipboard_relay_agent.agent import (
+    AUTHENTICATION_FAILURE_EXIT_CODE,
+    AuthenticationError,
+    RegistrationError,
     build_connection_target,
     build_headers,
     configure_logging,
     handle_message,
+    main,
     register_configured_device,
     registration_url,
     send_registration_request,
@@ -93,6 +99,87 @@ def test_registration_reuses_saved_device_id_without_prompt(monkeypatch, tmp_pat
     assert config.device_id == "saved-mac"
 
 
+def test_registration_http_401_raises_authentication_error(monkeypatch) -> None:
+    """密码错误必须映射为 AuthenticationError，不能吞成普通注册失败。"""
+    error = HTTPError(
+        "https://clip.hcid274.cn/api/devices/register",
+        401,
+        "Unauthorized",
+        {},
+        io.BytesIO(b'{"detail":"invalid password"}'),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    try:
+        send_registration_request(
+            "wss://example.test/ws/agent", "wrong-password", "mac-office"
+        )
+        raise AssertionError("expected AuthenticationError")
+    except AuthenticationError as exc:
+        assert "401" in str(exc)
+        assert "invalid password" in str(exc)
+
+
+def test_registration_http_403_is_not_authentication_error(monkeypatch) -> None:
+    error = HTTPError(
+        "https://clip.hcid274.cn/api/devices/register",
+        403,
+        "Forbidden",
+        {},
+        io.BytesIO(b'{"detail":"device limit reached"}'),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    try:
+        send_registration_request(
+            "wss://example.test/ws/agent", "secret-key", "mac-extra"
+        )
+        raise AssertionError("expected RegistrationError")
+    except AuthenticationError:
+        raise AssertionError("403 must not be AuthenticationError")
+    except RegistrationError as exc:
+        assert "403" in str(exc)
+
+
+def test_main_authentication_failure_clears_password_and_uses_exit_code_3(
+    monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "device_id": "mac-office",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agent_module, "configure_logging", lambda: logging.getLogger("test"))
+    monkeypatch.setattr(
+        agent_module,
+        "send_registration_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AuthenticationError("设备注册失败（HTTP 401）：invalid password")
+        ),
+    )
+
+    exit_code = main(["--config", str(config_path), "--register-only"])
+
+    assert exit_code == AUTHENTICATION_FAILURE_EXIT_CODE
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["password"] == ""
+    assert saved["device_id"] == "mac-office"
+
+
 def test_registration_uses_static_ip_with_original_http_host_and_tls_name(
     monkeypatch,
 ) -> None:
@@ -129,6 +216,41 @@ def test_registration_uses_static_ip_with_original_http_host_and_tls_name(
     assert calls[1][0:3] == ("request", "POST", "/api/devices/register")
     assert calls[1][3] == {"device_id": "mac-china"}
     assert calls[1][4]["X-API-Key"] == "secret-key"
+
+
+def test_static_ip_registration_http_401_raises_authentication_error(monkeypatch) -> None:
+    """生产域名走静态 IP 连接时，401 也必须映射为 AuthenticationError。"""
+
+    class Response:
+        status = 401
+        reason = "Unauthorized"
+
+        def read(self):
+            return b'{"detail":"invalid password"}'
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            return None
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agent_module, "StaticAddressHTTPSConnection", Connection)
+
+    try:
+        send_registration_request(
+            "wss://clip.hcid274.cn/ws/agent", "wrong-password", "mac-china"
+        )
+        raise AssertionError("expected AuthenticationError")
+    except AuthenticationError as exc:
+        assert "401" in str(exc)
+        assert "invalid password" in str(exc)
 
 
 def test_build_connection_target_uses_static_ip_with_original_host_and_sni() -> None:
