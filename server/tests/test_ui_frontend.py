@@ -19,6 +19,16 @@ def test_new_ui_connection_resets_snapshot_version_before_receiving_messages() -
     assert "uiSocket !== socket || connectionId !== latestUiConnectionId" in page
 
 
+def test_device_rows_use_text_content_for_server_supplied_values() -> None:
+    page = read_ui_page()
+
+    assert "row.innerHTML" not in page
+    assert "targetList.replaceChildren()" in page
+    assert "deviceListEl.replaceChildren()" in page
+    assert 'makeElement("span", "name", d.device_id)' in page
+    assert '"最后活跃 · " + formatLastActive(d.last_active)' in page
+
+
 def test_password_login_gate_verifies_before_persisting_or_connecting() -> None:
     """登录遮罩必须在密码校验成功后才保存密码并建立 UI 连接。"""
     page = read_ui_page()

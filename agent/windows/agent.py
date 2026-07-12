@@ -6,6 +6,7 @@ import socket
 import sys
 import time
 from collections.abc import Callable
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -31,6 +32,10 @@ from clipboard_relay_shared.prompt import prompt_device_id  # noqa: E402
 TASK_NAME = "ClipboardRelayAgent"
 STABLE_CONNECTION_SECONDS = 60
 CONNECT_TIMEOUT_SECONDS = 8
+PING_INTERVAL_SECONDS = 30
+PING_TIMEOUT_SECONDS = 10
+LOG_MAX_BYTES = 1_048_576
+LOG_BACKUP_COUNT = 3
 PLACEHOLDER_PASSWORDS = frozenset(
     {"replace-with-shared-key", "replace-with-relay-password"}
 )
@@ -95,7 +100,14 @@ def setup_logging() -> None:
     log_path = get_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    handlers: list[logging.Handler] = [logging.FileHandler(log_path, encoding="utf-8")]
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(
+            log_path,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    ]
     if sys.stdout is not None:
         handlers.append(logging.StreamHandler(sys.stdout))
 
@@ -129,8 +141,13 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         sys.exit(1)
 
     server_ws_url = config.get("server_ws_url", config.get("ws_url"))
-    if not isinstance(server_ws_url, str) or urlparse(server_ws_url).scheme not in {"ws", "wss"}:
-        logging.error("server_ws_url must be a ws:// or wss:// URL")
+    parsed_server_url = urlparse(server_ws_url) if isinstance(server_ws_url, str) else None
+    if (
+        parsed_server_url is None
+        or parsed_server_url.scheme not in {"ws", "wss"}
+        or not parsed_server_url.hostname
+    ):
+        logging.error("server_ws_url must be a ws:// or wss:// URL with a host")
         sys.exit(1)
 
     try:
@@ -141,7 +158,7 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
 
     device_id = config.get("device_id")
     if device_id is None:
-        legacy_device_ids = parse_qs(urlparse(server_ws_url).query).get("device_id")
+        legacy_device_ids = parse_qs(parsed_server_url.query).get("device_id")
         if legacy_device_ids:
             device_id = legacy_device_ids[0]
     if device_id is not None and (not isinstance(device_id, str) or not device_id.strip()):
@@ -180,6 +197,9 @@ def clear_password(config_path: Path) -> None:
     if not isinstance(raw, dict):
         raise ValueError("config root must be a JSON object")
     raw["password"] = ""
+    # 兼容旧配置：两个字段同时存在时，错误密码不能继续从 api_key 生效。
+    if "api_key" in raw:
+        raw["api_key"] = ""
     _write_config(config_path, raw)
 
 
@@ -277,6 +297,10 @@ def on_message(ws_app: websocket.WebSocketApp, message: str) -> None:
         pyperclip.copy(text)
     except Exception:
         logging.exception("failed to write clipboard")
+        try:
+            ws_app.send(json.dumps({"type": "clipboard_report", "status": "failed"}))
+        except Exception:
+            logging.exception("failed to send clipboard failure report")
         return
 
     logging.info("clipboard write succeeded length=%d", len(text))
@@ -300,6 +324,7 @@ def on_close(
 
 def run(*, register_only: bool = False, config_path: Path | None = None) -> None:
     setup_logging()
+    websocket.setdefaulttimeout(CONNECT_TIMEOUT_SECONDS)
     active_config_path = config_path or get_config_path()
     config = load_config(active_config_path)
     try:
@@ -307,6 +332,10 @@ def run(*, register_only: bool = False, config_path: Path | None = None) -> None
     except AuthenticationError as exc:
         logging.error("%s", exc)
         print(str(exc), file=sys.stderr)
+        try:
+            clear_password(active_config_path)
+        except (OSError, ValueError, json.JSONDecodeError) as clear_exc:
+            logging.error("failed to clear rejected password: %s", clear_exc)
         raise SystemExit(AUTHENTICATION_FAILURE_EXIT_CODE) from exc
     except RegistrationError as exc:
         logging.error("%s", exc)
@@ -337,7 +366,12 @@ def run(*, register_only: bool = False, config_path: Path | None = None) -> None
         )
 
         try:
-            ws_app.run_forever()
+            ws_app.run_forever(
+                http_proxy_timeout=CONNECT_TIMEOUT_SECONDS,
+                ping_interval=PING_INTERVAL_SECONDS,
+                ping_timeout=PING_TIMEOUT_SECONDS,
+                skip_utf8_validation=True,
+            )
         except KeyboardInterrupt:
             logging.info("stopped by user")
             return

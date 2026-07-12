@@ -1,5 +1,7 @@
 import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from urllib.error import HTTPError
 
 import pytest
@@ -31,6 +33,28 @@ def test_load_config_rejects_non_ascii_password(tmp_path) -> None:
             {
                 "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
                 "password": "中文密码",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit):
+        agent.load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "server_ws_url",
+    ["https://clip.hcid274.cn/ws/agent", "wss:///ws/agent", "ws://:80/path"],
+)
+def test_load_config_rejects_websocket_url_without_valid_scheme_and_host(
+    tmp_path, server_ws_url
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": server_ws_url,
+                "password": "secret-password",
             }
         ),
         encoding="utf-8",
@@ -185,6 +209,7 @@ def test_authentication_failure_uses_a_distinct_exit_code(tmp_path, monkeypatch)
         agent.run(register_only=True, config_path=config_path)
 
     assert exc_info.value.code == agent.AUTHENTICATION_FAILURE_EXIT_CODE
+    assert json.loads(config_path.read_text(encoding="utf-8"))["password"] == ""
 
 
 def test_clear_password_makes_the_installer_prompt_on_the_next_run(tmp_path) -> None:
@@ -204,6 +229,85 @@ def test_clear_password_makes_the_installer_prompt_on_the_next_run(tmp_path) -> 
 
     assert agent.password_setup_status(config_path) == 0
     assert json.loads(config_path.read_text(encoding="utf-8"))["password"] == ""
+
+
+def test_clear_password_also_clears_legacy_api_key(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "wrong-password",
+                "api_key": "legacy-key",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    agent.clear_password(config_path)
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["password"] == ""
+    assert saved["api_key"] == ""
+
+
+def test_setup_logging_uses_bounded_rotating_file_handler(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "agent.log"
+    monkeypatch.setattr(agent, "get_log_path", lambda: log_path)
+
+    agent.setup_logging()
+
+    try:
+        file_handlers = [
+            handler for handler in logging.getLogger().handlers if isinstance(handler, RotatingFileHandler)
+        ]
+        assert len(file_handlers) == 1
+        assert file_handlers[0].maxBytes == agent.LOG_MAX_BYTES
+        assert file_handlers[0].backupCount == agent.LOG_BACKUP_COUNT
+    finally:
+        for handler in logging.getLogger().handlers:
+            handler.close()
+
+
+def test_run_sets_websocket_timeout_and_heartbeat(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "secret-password",
+                "device_id": "win-office",
+            }
+        ),
+        encoding="utf-8",
+    )
+    timeouts = []
+    run_options = []
+
+    class InterruptingWebSocketApp:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def run_forever(self, **kwargs) -> None:
+            run_options.append(kwargs)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "setup_logging", lambda: None)
+    monkeypatch.setattr(agent, "register_configured_device", lambda config, *_args: config)
+    monkeypatch.setattr(agent.websocket, "setdefaulttimeout", timeouts.append)
+    monkeypatch.setattr(agent.websocket, "WebSocketApp", InterruptingWebSocketApp)
+
+    agent.run(config_path=config_path)
+
+    assert timeouts == [agent.CONNECT_TIMEOUT_SECONDS]
+    assert run_options == [
+        {
+            "http_proxy_timeout": agent.CONNECT_TIMEOUT_SECONDS,
+            "ping_interval": agent.PING_INTERVAL_SECONDS,
+            "ping_timeout": agent.PING_TIMEOUT_SECONDS,
+            "skip_utf8_validation": True,
+        }
+    ]
 
 
 def test_build_pong_reply_echoes_ping_fields() -> None:

@@ -87,6 +87,28 @@ def test_load_config_rejects_non_ascii_password(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+@pytest.mark.parametrize(
+    "server_ws_url",
+    ["https://clip.hcid274.cn/ws/agent", "wss:///ws/agent", "ws://:80/path"],
+)
+def test_load_config_rejects_websocket_url_without_valid_scheme_and_host(
+    tmp_path: Path, server_ws_url: str
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": server_ws_url,
+                "password": "secret-key",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="ws:// or wss:// URL with a host"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_placeholder_password(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

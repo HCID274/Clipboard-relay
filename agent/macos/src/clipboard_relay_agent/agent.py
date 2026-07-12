@@ -181,7 +181,7 @@ def handle_message(
 ) -> dict[str, Any] | None:
     """处理服务端下行消息。
 
-    * ``clipboard``：写入系统剪贴板。
+    * ``clipboard``：写入系统剪贴板；写入失败时返回失败回执。
     * ``ping``：返回 ``pong`` 载荷，供调用方立刻回传以测服务器↔本机 RTT。
     其它类型忽略。返回值非 None 时表示需要经 WebSocket 发回服务端。
     """
@@ -226,7 +226,8 @@ def handle_message(
         copy_text(text)
     except Exception:
         active_logger.exception("failed to write clipboard")
-        return None
+        # 仅供服务端记日志；不改变 HTTP /api/send 的即时成功语义。
+        return {"type": "clipboard_report", "status": "failed"}
 
     active_logger.info("clipboard updated length=%s", len(text))
     return None
@@ -278,13 +279,7 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
                 try:
                     ws_app.send(json.dumps(reply, ensure_ascii=True))
                 except Exception:
-                    logger.exception("failed to send pong")
-            update_status(
-                server_ws_url=websocket_url,
-                connected=True,
-                event="message",
-                reconnect_attempts=current_reconnect_attempts,
-            )
+                    logger.exception("failed to send agent reply")
 
         def on_error(_ws: websocket.WebSocketApp, err: Any) -> None:
             logger.error("websocket error: %s", err)

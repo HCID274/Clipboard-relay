@@ -45,12 +45,15 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         raise ConfigError("Config root must be a JSON object")
 
     server_ws_url = _required_string(raw, "server_ws_url")
+    parsed_server_url = urlparse(server_ws_url)
+    if parsed_server_url.scheme not in {"ws", "wss"} or not parsed_server_url.hostname:
+        raise ConfigError("Config value 'server_ws_url' must be a ws:// or wss:// URL with a host")
     password_key = "password" if "password" in raw else "api_key"
     api_key = validate_password(raw.get(password_key), password_key)
     reconnect_seconds = _reconnect_seconds(raw.get("reconnect_seconds", DEFAULT_RECONNECT_SECONDS))
     device_id = raw.get("device_id")
     if device_id is None:
-        legacy_device_ids = parse_qs(urlparse(server_ws_url).query).get("device_id")
+        legacy_device_ids = parse_qs(parsed_server_url.query).get("device_id")
         if legacy_device_ids:
             device_id = legacy_device_ids[0]
     if device_id is not None and (not isinstance(device_id, str) or not device_id.strip()):

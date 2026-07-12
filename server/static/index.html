@@ -834,6 +834,22 @@
         }
       }
 
+      function makeElement(tagName, className = "", text = null) {
+        const element = document.createElement(tagName);
+        if (className) element.className = className;
+        if (text !== null) element.textContent = text;
+        return element;
+      }
+
+      function presenceClass(online) {
+        return online ? "online" : "offline";
+      }
+
+      function makeStatusText(online) {
+        const state = presenceClass(online);
+        return makeElement("span", "status-text " + state, online ? "在线" : "离线");
+      }
+
       function updateLatenciesOnly() {
         const dev = devices.find((d) => d.device_id === target);
         setLatencyEl(selLatency, dev ? getLatencyMs(dev) : null, { animate: true });
@@ -877,18 +893,18 @@
         lastStructureKey = key;
 
         // 结构变化：重建列表（此时允许 itemIn 入场一次）
-        targetList.innerHTML = "";
+        targetList.replaceChildren();
         devices.forEach((d) => {
           const row = document.createElement("button");
           row.type = "button";
           row.dataset.deviceId = d.device_id;
           row.className = "picker-row" + (d.device_id === target ? " selected" : "");
           const dms = getLatencyMs(d);
-          row.innerHTML =
-            '<span class="dot' + (d.online ? " online" : " offline") + '"></span>' +
-            '<span class="name">' + d.device_id + "</span>" +
-            '<span class="latency ' + latencyClass(dms) + '">' + latencyText(dms) + "</span>" +
-            '<span class="status-text ' + (d.online ? "online" : "offline") + '">' + (d.online ? "在线" : "离线") + "</span>";
+          const dot = makeElement("span", "dot " + presenceClass(d.online));
+          const name = makeElement("span", "name", d.device_id);
+          const latency = makeElement("span");
+          setLatencyEl(latency, dms);
+          row.append(dot, name, latency, makeStatusText(d.online));
           row.addEventListener("click", () => {
             target = d.device_id;
             localStorage.setItem(TARGET_STORAGE_KEY, target);
@@ -900,22 +916,23 @@
         });
         setLatencyEl(selLatency, dev ? getLatencyMs(dev) : null, { animate: false });
 
-        deviceListEl.innerHTML = "";
+        deviceListEl.replaceChildren();
         devices.forEach((d) => {
           const row = document.createElement("div");
           row.className = "device-row";
           row.dataset.deviceId = d.device_id;
           const dms = getLatencyMs(d);
-          row.innerHTML =
-            '<span class="dot' + (d.online ? " online" : " offline") + '"></span>' +
-            '<div style="flex:1;min-width:0">' +
-              '<div class="name-row">' +
-                '<span class="name">' + d.device_id + "</span>" +
-                '<span class="status-text ' + (d.online ? "online" : "offline") + '">' + (d.online ? "在线" : "离线") + "</span>" +
-                '<span class="latency compact ' + latencyClass(dms) + '">' + latencyText(dms) + "</span>" +
-              "</div>" +
-              '<div class="meta">最后活跃 · ' + formatLastActive(d.last_active) + "</div>" +
-            "</div>";
+          const dot = makeElement("span", "dot " + presenceClass(d.online));
+          const content = makeElement("div");
+          content.style.cssText = "flex:1;min-width:0";
+          const nameRow = makeElement("div", "name-row");
+          const name = makeElement("span", "name", d.device_id);
+          const latency = makeElement("span");
+          setLatencyEl(latency, dms, { compact: true });
+          const meta = makeElement("div", "meta", "最后活跃 · " + formatLastActive(d.last_active));
+          nameRow.append(name, makeStatusText(d.online), latency);
+          content.append(nameRow, meta);
+          row.append(dot, content);
           const del = document.createElement("button");
           del.type = "button";
           del.className = "delete-btn";

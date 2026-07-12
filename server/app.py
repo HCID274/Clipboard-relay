@@ -416,7 +416,14 @@ class AgentConnections:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if not isinstance(payload, dict) or payload.get("type") != "pong":
+        if not isinstance(payload, dict):
+            return
+        message_type = payload.get("type")
+        if message_type == "clipboard_report":
+            if payload.get("status") == "failed":
+                LOGGER.warning("agent %s failed to write a clipboard message", device_id)
+            return
+        if message_type != "pong":
             return
         pending = self._pending_pings.get(device_id)
         if pending is None or pending.future.done():
@@ -442,12 +449,6 @@ class AgentConnections:
         if websocket is None:
             self.latency_ms[device_id] = None
             return None
-        # 真实 Starlette WebSocket 必然提供 send_json；此分支让测试替身或内部错误不被误判为
-        # Agent 网络半开，从而避免服务端因为自身调用错误踢掉有效连接。
-        if not callable(getattr(websocket, "send_json", None)):
-            LOGGER.warning("agent websocket %s has no send_json method", device_id)
-            return None
-
         loop = asyncio.get_running_loop()
         probe_id = uuid.uuid4().hex
         sent_at = time.perf_counter()

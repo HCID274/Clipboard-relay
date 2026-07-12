@@ -8,6 +8,8 @@ from types import ModuleType
 from typing import Any
 
 _UNSET: Any = object()
+# readline 预填/清理路径上可安全忽略的软错误（环境差异、不可用 hook 等）。
+_READLINE_SOFT_ERRORS = (AttributeError, OSError, RuntimeError)
 
 
 def _load_readline() -> ModuleType | None:
@@ -59,7 +61,7 @@ def _prompt_with_readline(
             return
         try:
             redisplay()
-        except Exception:
+        except _READLINE_SOFT_ERRORS:
             pass
 
     try:
@@ -69,11 +71,11 @@ def _prompt_with_readline(
         finally:
             readline_mod.set_startup_hook()
         return _resolve_input(entered, suggestion)
-    except Exception:
+    except _READLINE_SOFT_ERRORS:
         # 预填失败时降级为「括号默认值」提示。
         try:
             readline_mod.set_startup_hook()
-        except Exception:
+        except _READLINE_SOFT_ERRORS:
             pass
         return None
 

@@ -437,9 +437,13 @@ def test_list_online_last_active_is_fresh_without_disk_write(
 
 
 def test_list_devices_includes_cached_latency_ms(client: TestClient) -> None:
+    class OnlineWebSocket:
+        async def send_json(self, _payload: dict) -> None:
+            return None
+
     relay_app.DEVICES["mac-china"] = record("mac-china")
     relay_app.DEVICES["win-fukuoka"] = record("win-fukuoka")
-    relay_app.agents.websockets["mac-china"] = object()  # type: ignore[assignment]
+    relay_app.agents.websockets["mac-china"] = OnlineWebSocket()  # type: ignore[assignment]
     relay_app.agents.latency_ms["mac-china"] = 42
 
     response = client.get("/api/devices", headers=headers())

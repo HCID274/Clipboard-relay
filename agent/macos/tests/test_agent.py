@@ -269,7 +269,7 @@ def test_handle_message_logs_copy_failure_without_raising(caplog) -> None:
 
     caplog.set_level(logging.ERROR)
 
-    handle_message(
+    reply = handle_message(
         '{"type":"clipboard","text":"hello"}',
         copy_text=fail_copy,
         logger=logging.getLogger("test.clipboard"),
@@ -277,6 +277,7 @@ def test_handle_message_logs_copy_failure_without_raising(caplog) -> None:
 
     assert "failed to write clipboard" in caplog.text
     assert "hello" not in caplog.text
+    assert reply == {"type": "clipboard_report", "status": "failed"}
 
 
 def test_run_agent_exits_cleanly_on_keyboard_interrupt(monkeypatch) -> None:
@@ -428,6 +429,37 @@ def test_run_agent_records_connection_lifecycle_status(monkeypatch, tmp_path) ->
     assert final_status["event"] == "closed"
     assert final_status["last_close_status"] == 1006
     assert final_status["last_close_reason"] == "ping timeout"
+
+
+def test_run_agent_does_not_write_status_for_each_server_message(monkeypatch, tmp_path) -> None:
+    status_path = tmp_path / "status.json"
+
+    class MessageWebSocketApp:
+        def __init__(self, *_args, **kwargs) -> None:
+            self.on_open = kwargs["on_open"]
+            self.on_message = kwargs["on_message"]
+
+        def send(self, _message: str) -> None:
+            return None
+
+        def run_forever(self, **_kwargs) -> None:
+            self.on_open(self)
+            persisted_before_message = status_path.read_text(encoding="utf-8")
+            self.on_message(self, '{"type":"ping","id":"probe"}')
+            assert status_path.read_text(encoding="utf-8") == persisted_before_message
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_module.websocket, "WebSocketApp", MessageWebSocketApp)
+    monkeypatch.setattr(agent_module, "STATUS_PATH", status_path)
+
+    run_agent(
+        Config(
+            server_ws_url="wss://clip.hcid274.cn/ws/agent?device_id=mac-china",
+            api_key="secret-key",
+            reconnect_seconds=5,
+        ),
+        logging.getLogger("test.clipboard"),
+    )
 
 
 def test_run_agent_sets_websocket_default_timeout(monkeypatch) -> None:
