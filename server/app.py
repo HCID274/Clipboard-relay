@@ -189,6 +189,11 @@ async def reject_websocket(websocket: WebSocket) -> None:
     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
 
 
+def _is_websocket_not_connected_error(error: RuntimeError) -> bool:
+    """Starlette may raise RuntimeError when a server-closed socket is read again."""
+    return 'WebSocket is not connected. Need to call "accept" first.' in str(error)
+
+
 # 应用层 RTT：服务端发 ping、Agent 回 pong；列表接口返回缓存的 latency_ms。
 # 探测周期和超时均保持在一秒以内，以便半开连接不会长期显示为在线。
 LATENCY_PROBE_INTERVAL_SECONDS = 0.75
@@ -694,7 +699,12 @@ async def websocket_agent(websocket: WebSocket) -> None:
     try:
         while True:
             # 消费 Agent 上行（pong 等）；剪贴板只由服务端下发。
-            raw = await websocket.receive_text()
+            try:
+                raw = await websocket.receive_text()
+            except RuntimeError as error:
+                if _is_websocket_not_connected_error(error):
+                    raise WebSocketDisconnect(code=status.WS_1006_ABNORMAL_CLOSURE) from error
+                raise
             agents.handle_agent_text(device_id, raw, websocket)
     except WebSocketDisconnect:
         async with device_lock:
@@ -719,6 +729,11 @@ async def websocket_ui(websocket: WebSocket) -> None:
     try:
         while True:
             # 浏览器无需发送业务消息；持续 receive 用于感知断开并回收发送协程。
-            await websocket.receive_text()
+            try:
+                await websocket.receive_text()
+            except RuntimeError as error:
+                if _is_websocket_not_connected_error(error):
+                    raise WebSocketDisconnect(code=status.WS_1006_ABNORMAL_CLOSURE) from error
+                raise
     except WebSocketDisconnect:
         await ui_clients.disconnect(client)

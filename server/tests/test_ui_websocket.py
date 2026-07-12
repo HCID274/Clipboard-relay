@@ -113,6 +113,45 @@ def test_ui_rejection_accepts_before_closing() -> None:
     assert websocket.close_codes == [1008]
 
 
+def test_ui_runtime_error_disconnect_removes_client_and_cancels_sender() -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    ticket = relay_app.ui_tickets.issue()
+
+    class RuntimeDisconnectWebSocket:
+        query_params = {"ticket": ticket}
+
+        def __init__(self) -> None:
+            self.accepted = False
+            self.sent = asyncio.Event()
+            self.captured_client: relay_app._UiClient | None = None
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def send_json(self, _payload: dict) -> None:
+            self.sent.set()
+
+        async def receive_text(self) -> str:
+            await self.sent.wait()
+            self.captured_client = next(iter(relay_app.ui_clients._clients))
+            raise RuntimeError(
+                'WebSocket is not connected. Need to call "accept" first.'
+            )
+
+    async def connect_and_runtime_disconnect() -> RuntimeDisconnectWebSocket:
+        websocket = RuntimeDisconnectWebSocket()
+        await relay_app.websocket_ui(websocket)
+        await asyncio.sleep(0)
+        return websocket
+
+    websocket = asyncio.run(connect_and_runtime_disconnect())
+
+    assert websocket.accepted is True
+    assert websocket.captured_client is not None
+    assert websocket.captured_client.sender_task.cancelled()
+    assert relay_app.ui_clients._clients == set()
+
+
 def test_ui_subscription_serializes_initial_snapshot_with_publish() -> None:
     """建连中的初始快照和并发推送必须在同一订阅锁下按版本完成。"""
 
