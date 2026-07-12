@@ -325,6 +325,18 @@
       }
       input[type="password"]:focus { border-color: #ff7a18; }
 
+      .credential-state {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 48px;
+        padding: 12px 14px;
+        border: 1px solid #2a2e33;
+        border-radius: 13px;
+        background: #1a1c1f;
+      }
+      .credential-state-copy { display: flex; align-items: center; gap: 9px; color: #8b9198; font-size: 13px; }
+
       textarea {
         font-family: inherit;
         font-size: 16px;
@@ -497,6 +509,72 @@
       }
       .delete-btn:active { transform: scale(.95); }
 
+      .auth-gate {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        background: rgba(8,9,11,.8);
+        backdrop-filter: blur(12px);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity .24s ease;
+      }
+      .auth-gate.open { opacity: 1; pointer-events: auto; }
+      .auth-card {
+        width: min(100%, 390px);
+        padding: 27px 24px 24px;
+        border: 1px solid #363b42;
+        border-radius: 23px;
+        background: linear-gradient(145deg, #202327, #151719 72%);
+        box-shadow: 0 28px 80px rgba(0,0,0,.58);
+        transform: translateY(10px) scale(.985);
+        transition: transform .28s cubic-bezier(.2,.85,.3,1.15);
+      }
+      .auth-gate.open .auth-card { transform: translateY(0) scale(1); }
+      .auth-mark {
+        width: 38px;
+        height: 38px;
+        display: grid;
+        place-items: center;
+        margin-bottom: 21px;
+        border-radius: 12px;
+        background: rgba(255,122,24,.15);
+        color: #ff9d53;
+        font-size: 18px;
+        box-shadow: inset 0 0 0 1px rgba(255,122,24,.24);
+      }
+      .auth-title { margin: 0; font-size: 23px; line-height: 1.2; }
+      .auth-description { margin: 9px 0 21px; color: #8b9198; font-size: 14px; line-height: 1.6; }
+      .auth-form .label { display: block; margin-bottom: 9px; }
+      .auth-form input { margin-bottom: 10px; }
+      .auth-submit {
+        width: 100%;
+        border: 0;
+        border-radius: 13px;
+        padding: 14px;
+        color: #1a0f04;
+        background: #ff7a18;
+        box-shadow: 0 10px 26px rgba(255,122,24,.18);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 15px;
+        font-weight: 800;
+        transition: transform .12s ease, filter .2s, opacity .2s;
+      }
+      .auth-submit:active { transform: scale(.98); }
+      .auth-submit:disabled { cursor: wait; filter: saturate(.4); opacity: .72; }
+      .auth-feedback { min-height: 20px; margin: 12px 0 0; color: #8b9198; font-size: 13px; font-weight: 600; }
+      .auth-feedback.bad { color: #ef5350; }
+
+      @media (max-width: 380px) {
+        main { padding-top: 27px; }
+        .auth-card { padding: 23px 19px 20px; }
+      }
+
       @keyframes pulseG {
         0% { box-shadow: 0 0 0 0 rgba(53,194,107,.5); }
         70% { box-shadow: 0 0 0 6px rgba(53,194,107,0); }
@@ -534,7 +612,7 @@
     </template>
   </head>
   <body>
-    <main>
+    <main id="appMain">
       <div class="header">
         <div>
           <div class="eyebrow mono">CLIPBOARD RELAY</div>
@@ -548,10 +626,12 @@
 
       <div class="field">
         <div class="field-label-row">
-          <span class="label mono">密码 / API KEY</span>
-          <button type="button" id="clearKey" class="link-btn">清除</button>
+          <span class="label mono">访问密码</span>
+          <button type="button" id="clearKey" class="link-btn">清除密码</button>
         </div>
-        <input id="apiKey" type="password" autocomplete="off" placeholder="输入访问密码">
+        <div class="credential-state">
+          <span class="credential-state-copy"><span class="dot online"></span>密码已验证并保存在此浏览器中</span>
+        </div>
       </div>
 
       <div class="label mono target-label">目标设备</div>
@@ -588,11 +668,26 @@
       </div>
     </div>
 
+    <div class="auth-gate" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-describedby="authDescription">
+      <div class="auth-card">
+        <div class="auth-mark" aria-hidden="true">↗</div>
+        <div class="eyebrow mono">CLIPBOARD RELAY</div>
+        <h2 class="auth-title display" id="authTitle">连接中继服务</h2>
+        <p class="auth-description" id="authDescription">请输入访问密码以验证身份，并恢复设备连接。</p>
+        <form class="auth-form" id="authForm">
+          <label class="label mono" for="authPassword">访问密码</label>
+          <input id="authPassword" type="password" autocomplete="current-password" placeholder="输入访问密码" required>
+          <button class="auth-submit" id="authConfirm" type="submit">确认并连接</button>
+          <p class="auth-feedback" id="authFeedback" aria-live="polite"></p>
+        </form>
+      </div>
+    </div>
+
     <script>
       const API_KEY_STORAGE_KEY = "clipboardRelayApiKey";
       const TARGET_STORAGE_KEY = "clipboardRelayTarget";
+      const INVALID_CACHED_PASSWORD_MESSAGE = "保存的密码已失效，请重新验证。";
 
-      const apiKeyInput = document.querySelector("#apiKey");
       const clearKeyButton = document.querySelector("#clearKey");
       const textInput = document.querySelector("#text");
       const sendButton = document.querySelector("#send");
@@ -612,22 +707,79 @@
       const sheet = document.querySelector("#sheet");
       const sheetMeta = document.querySelector("#sheetMeta");
       const deviceListEl = document.querySelector("#deviceList");
+      const appMain = document.querySelector("#appMain");
+      const authGate = document.querySelector("#authGate");
+      const authForm = document.querySelector("#authForm");
+      const authPasswordInput = document.querySelector("#authPassword");
+      const authConfirmButton = document.querySelector("#authConfirm");
+      const authFeedback = document.querySelector("#authFeedback");
 
       let devices = [];
       let target = localStorage.getItem(TARGET_STORAGE_KEY) || "";
       let targetOpen = false;
       let uiSocket = null;
       let uiReconnectTimer = null;
-      let passwordReconnectTimer = null;
       let latestUiConnectionId = 0;
       let latestSnapshotVersion = -1;
-
-      const savedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
-      if (savedKey) apiKeyInput.value = savedKey;
+      let apiKey = localStorage.getItem(API_KEY_STORAGE_KEY)?.trim() || "";
 
       function setStatus(message, kind) {
         statusEl.textContent = message;
         statusEl.className = kind || "";
+      }
+
+      function setAuthFeedback(message, kind = "") {
+        authFeedback.textContent = message;
+        authFeedback.className = "auth-feedback" + (kind ? " " + kind : "");
+      }
+
+      function showAuthGate(message = "") {
+        authPasswordInput.value = "";
+        setAuthFeedback(message, message ? "bad" : "");
+        appMain.inert = true;
+        authGate.classList.add("open");
+        window.setTimeout(() => authPasswordInput.focus(), 180);
+      }
+
+      function hideAuthGate() {
+        authGate.classList.remove("open");
+        appMain.inert = false;
+      }
+
+      function clearCachedPassword(message) {
+        localStorage.removeItem(API_KEY_STORAGE_KEY);
+        apiKey = "";
+        resetDevices();
+        ++latestUiConnectionId;
+        window.clearTimeout(uiReconnectTimer);
+        closeUiSocket();
+        if (message) setStatus(message, "bad");
+        showAuthGate(message);
+      }
+
+      async function confirmPassword(password) {
+        const response = await fetch("/api/ui-ticket", {
+          method: "POST",
+          headers: { "X-API-Key": password },
+        });
+        if (response.status === 401) {
+          throw new Error("密码错误，请重新输入。");
+        }
+        if (response.status === 500) {
+          throw new Error("服务端密码未配置。");
+        }
+        if (!response.ok) {
+          throw new Error("无法连接到中继服务器。");
+        }
+        const payload = await response.json();
+        if (!hasTicket(payload)) {
+          throw new Error("中继服务器返回了无效响应。");
+        }
+        return payload.ticket;
+      }
+
+      function hasTicket(payload) {
+        return payload && typeof payload.ticket === "string";
       }
 
       function formatLastActive(value) {
@@ -719,8 +871,12 @@
             try {
               const response = await fetch("/api/devices/" + encodeURIComponent(d.device_id), {
                 method: "DELETE",
-                headers: { "X-API-Key": apiKeyInput.value.trim() },
+                headers: { "X-API-Key": apiKey },
               });
+              if (response.status === 401) {
+                clearCachedPassword(INVALID_CACHED_PASSWORD_MESSAGE);
+                return;
+              }
               if (!response.ok) {
                 const payload = await response.json().catch(() => ({}));
                 throw new Error(payload.detail || "HTTP " + response.status);
@@ -756,16 +912,34 @@
       });
 
       clearKeyButton.addEventListener("click", () => {
-        localStorage.removeItem(API_KEY_STORAGE_KEY);
-        apiKeyInput.value = "";
-        apiKeyInput.focus();
-        setStatus("密码已清除。", "");
-        scheduleUiConnection();
+        clearCachedPassword("密码已清除，请重新验证后继续使用。");
       });
 
-      apiKeyInput.addEventListener("input", () => {
-        window.clearTimeout(passwordReconnectTimer);
-        passwordReconnectTimer = window.setTimeout(scheduleUiConnection, 250);
+      authForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const password = authPasswordInput.value.trim();
+        if (!password) {
+          setAuthFeedback("请输入访问密码。", "bad");
+          authPasswordInput.focus();
+          return;
+        }
+        authConfirmButton.disabled = true;
+        authConfirmButton.textContent = "正在验证…";
+        setAuthFeedback("正在验证身份…");
+        try {
+          // 确认接口已成功校验密码，因此此处可以安全地持久化并直接复用票据建立首条连接。
+          const ticket = await confirmPassword(password);
+          apiKey = password;
+          localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+          hideAuthGate();
+          setStatus("密码验证成功，正在连接设备。", "ok");
+          connectUiWithTicket(++latestUiConnectionId, ticket);
+        } catch (error) {
+          setAuthFeedback(error.message || "网络连接失败，请稍后重试。", "bad");
+        } finally {
+          authConfirmButton.disabled = false;
+          authConfirmButton.textContent = "确认并连接";
+        }
       });
 
       function closeUiSocket() {
@@ -792,7 +966,6 @@
       }
 
       async function connectUi(connectionId) {
-        const apiKey = apiKeyInput.value.trim();
         if (!apiKey) {
           resetDevices();
           return;
@@ -808,8 +981,7 @@
           if (connectionId !== latestUiConnectionId) return;
 
           if (response.status === 401) {
-            resetDevices();
-            setStatus("密码错误。", "bad");
+            clearCachedPassword(INVALID_CACHED_PASSWORD_MESSAGE);
             return;
           }
           if (response.status === 500) {
@@ -822,43 +994,9 @@
           }
 
           const payload = await response.json();
-          if (!payload || typeof payload.ticket !== "string") throw new Error("invalid ticket payload");
+          if (!hasTicket(payload)) throw new Error("invalid ticket payload");
           if (connectionId !== latestUiConnectionId) return;
-
-          const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-          // 服务端重启后快照版本会重新从较小值开始，因此每个新 UI 连接都重新建立版本基线。
-          latestSnapshotVersion = -1;
-          const socket = new WebSocket(
-            scheme + "//" + window.location.host + "/ws/ui?ticket=" + encodeURIComponent(payload.ticket)
-          );
-          uiSocket = socket;
-          socket.addEventListener("message", (event) => {
-            // 旧连接在关闭后仍可能排队触发消息事件，旧连接的数据不能影响新连接的版本基线。
-            if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
-            let snapshot;
-            try {
-              snapshot = JSON.parse(event.data);
-            } catch (_error) {
-              return;
-            }
-            if (
-              snapshot.type !== "devices_snapshot" ||
-              !Number.isInteger(snapshot.version) ||
-              !Array.isArray(snapshot.devices) ||
-              snapshot.version < latestSnapshotVersion
-            ) {
-              return;
-            }
-            latestSnapshotVersion = snapshot.version;
-            devices = snapshot.devices;
-            render();
-          });
-          socket.addEventListener("close", () => {
-            if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
-            uiSocket = null;
-            // 票据是一次性的，因此每次断线都重新通过同源 HTTP 获取票据再连接。
-            scheduleUiConnection(1000);
-          });
+          connectUiWithTicket(connectionId, payload.ticket);
         } catch (error) {
           if (connectionId === latestUiConnectionId) {
             setStatus("网络连接失败。", "bad");
@@ -867,15 +1005,51 @@
         }
       }
 
+      function connectUiWithTicket(connectionId, ticket) {
+        if (connectionId !== latestUiConnectionId) return;
+        const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+        // 服务端重启后快照版本会重新从较小值开始，因此每个新 UI 连接都重新建立版本基线。
+        latestSnapshotVersion = -1;
+        const socket = new WebSocket(
+          scheme + "//" + window.location.host + "/ws/ui?ticket=" + encodeURIComponent(ticket)
+        );
+        uiSocket = socket;
+        socket.addEventListener("message", (event) => {
+          // 旧连接在关闭后仍可能排队触发消息事件，旧连接的数据不能影响新连接的版本基线。
+          if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
+          let snapshot;
+          try {
+            snapshot = JSON.parse(event.data);
+          } catch (_error) {
+            return;
+          }
+          if (
+            snapshot.type !== "devices_snapshot" ||
+            !Number.isInteger(snapshot.version) ||
+            !Array.isArray(snapshot.devices) ||
+            snapshot.version < latestSnapshotVersion
+          ) {
+            return;
+          }
+          latestSnapshotVersion = snapshot.version;
+          devices = snapshot.devices;
+          render();
+        });
+        socket.addEventListener("close", () => {
+          if (uiSocket !== socket || connectionId !== latestUiConnectionId) return;
+          uiSocket = null;
+          // 票据是一次性的，因此每次断线都重新通过同源 HTTP 获取票据再连接。
+          scheduleUiConnection(1000);
+        });
+      }
+
       sendButton.addEventListener("click", async () => {
-        const apiKey = apiKeyInput.value.trim();
         const text = textInput.value;
 
-        if (!apiKey) { setStatus("请输入密码。", "bad"); return; }
+        if (!apiKey) { showAuthGate("请先验证访问密码。"); return; }
         if (!target) { setStatus("当前没有可用设备。", "bad"); return; }
         if (!text.trim()) { setStatus("请输入要发送的文本。", "bad"); return; }
 
-        localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
         localStorage.setItem(TARGET_STORAGE_KEY, target);
         sendButton.disabled = true;
         sendLabelEl.textContent = "发送中…";
@@ -902,7 +1076,7 @@
               sendButton.classList.remove("sent");
             }, 1400);
           } else if (response.status === 401) {
-            setStatus("密码错误。", "bad");
+            clearCachedPassword(INVALID_CACHED_PASSWORD_MESSAGE);
           } else if (response.status === 503) {
             setStatus("目标设备未连接。", "bad");
           } else if (response.status === 400) {
@@ -919,7 +1093,11 @@
       });
 
       render();
-      scheduleUiConnection();
+      if (apiKey) {
+        scheduleUiConnection();
+      } else {
+        showAuthGate();
+      }
     </script>
 
 
