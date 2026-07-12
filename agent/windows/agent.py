@@ -2,25 +2,38 @@ import argparse
 import json
 import logging
 import os
-import re
 import socket
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 import pyperclip
 import websocket
 
+# 共享包位于 agent/clipboard_relay_shared（与 windows/ 同级）。
+_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AGENT_ROOT))
+
+from clipboard_relay_shared.device import (  # noqa: E402
+    build_agent_ws_url,
+    registration_url,
+    suggested_device_id,
+)
+from clipboard_relay_shared.prompt import prompt_device_id  # noqa: E402
+
 
 TASK_NAME = "ClipboardRelayAgent"
 STABLE_CONNECTION_SECONDS = 60
 CONNECT_TIMEOUT_SECONDS = 8
-DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
-PLACEHOLDER_PASSWORDS = {"replace-with-shared-key", "replace-with-relay-password"}
+PLACEHOLDER_PASSWORDS = frozenset(
+    {"replace-with-shared-key", "replace-with-relay-password"}
+)
 AUTHENTICATION_FAILURE_EXIT_CODE = 3
 
 
@@ -53,32 +66,29 @@ def validate_password(value: Any) -> str:
 
 
 def config_needs_password(config_path: Path) -> bool:
-    """Return whether a readable config needs a password to be supplied."""
+    """可读配置是否仍需要用户提供密码。"""
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read config file: {exc}") from exc
     if not isinstance(config, dict):
         raise ValueError("config root must be a JSON object")
-
     try:
         validate_password(config.get("password", config.get("api_key")))
+        return False
     except ValueError:
         return True
-    return False
 
 
 def password_setup_status(config_path: Path) -> int:
-    """Return the installer status for password setup.
+    """返回安装脚本用的密码状态码。
 
-    Status 0 requests a password, status 1 means that the existing password is
-    valid, and status 2 means that the config file could not be inspected.
+    0 — 需要提示用户输入密码；1 — 现有密码合法；2 — 配置无法检查。
     """
     try:
-        needs_password = config_needs_password(config_path)
+        return 0 if config_needs_password(config_path) else 1
     except ValueError:
         return 2
-    return 0 if needs_password else 1
 
 
 def setup_logging() -> None:
@@ -151,33 +161,18 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
-def registration_url(server_ws_url: str) -> str:
-    parsed = urlparse(server_ws_url)
-    scheme = "https" if parsed.scheme == "wss" else "http"
-    return urlunparse((scheme, parsed.netloc, "/api/devices/register", "", "", ""))
-
-
-def build_agent_ws_url(server_ws_url: str, device_id: str) -> str:
-    parsed = urlparse(server_ws_url)
-    query = parse_qs(parsed.query)
-    query["device_id"] = [device_id]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-
-
-def suggested_device_id(hostname: str) -> str:
-    suggestion = DEVICE_ID_REPLACEMENT_PATTERN.sub("-", hostname.lower()).strip("-")
-    suggestion = suggestion[:32].rstrip("-")
-    return suggestion if len(suggestion) >= 3 else "my-device"
-
-
-def save_device_id(config_path: Path, device_id: str) -> None:
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    raw["device_id"] = device_id
+def _write_config(config_path: Path, raw: dict[str, Any]) -> None:
     temporary_path = config_path.with_name(f".{config_path.name}.tmp")
     temporary_path.write_text(
         json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     temporary_path.replace(config_path)
+
+
+def save_device_id(config_path: Path, device_id: str) -> None:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["device_id"] = device_id
+    _write_config(config_path, raw)
 
 
 def clear_password(config_path: Path) -> None:
@@ -185,21 +180,29 @@ def clear_password(config_path: Path) -> None:
     if not isinstance(raw, dict):
         raise ValueError("config root must be a JSON object")
     raw["password"] = ""
-    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
-    temporary_path.write_text(
-        json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary_path.replace(config_path)
+    _write_config(config_path, raw)
+
+
+def _registration_http_error(exc: HTTPError) -> RegistrationError:
+    try:
+        detail = json.loads(exc.read().decode("utf-8")).get("detail", exc.reason)
+    except (json.JSONDecodeError, AttributeError):
+        detail = exc.reason
+    error_type = AuthenticationError if exc.code == 401 else RegistrationError
+    return error_type(f"设备注册失败（HTTP {exc.code}）：{detail}")
 
 
 def register_configured_device(
-    config: dict[str, Any], config_path: Path
+    config: dict[str, Any],
+    config_path: Path,
+    *,
+    prompt: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     device_id = config.get("device_id")
     if device_id is None:
         suggestion = suggested_device_id(socket.gethostname())
-        entered = input(f"设备名称 [{suggestion}]: ").strip()
-        device_id = entered or suggestion
+        # prompt 可在测试中注入；生产环境使用共享的预填交互。
+        device_id = (prompt or prompt_device_id)(suggestion)
 
     request = Request(
         registration_url(config["server_ws_url"]),
@@ -211,12 +214,7 @@ def register_configured_device(
         with urlopen(request, timeout=CONNECT_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        try:
-            detail = json.loads(exc.read().decode("utf-8")).get("detail", exc.reason)
-        except (json.JSONDecodeError, AttributeError):
-            detail = exc.reason
-        error_type = AuthenticationError if exc.code == 401 else RegistrationError
-        raise error_type(f"设备注册失败（HTTP {exc.code}）：{detail}") from exc
+        raise _registration_http_error(exc) from exc
     except (OSError, URLError, json.JSONDecodeError) as exc:
         raise RegistrationError(f"设备注册失败：{exc}") from exc
 

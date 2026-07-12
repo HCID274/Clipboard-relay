@@ -18,8 +18,9 @@ scripts/install_launchagent.sh
 
 首次运行会自动复制 `config.example.json`，并且安装脚本会隐藏回显地要求输入 `password`，因此用户
 不需要手动编辑任何配置文件。密码已填写且有效时，脚本会跳过密码提示，因而可以安全地重复运行。
-脚本会显示从 hostname 生成的设备名建议；用户可以回车确认或输入新名称。注册成功后，服务端返回的
-`device_id` 会保存到配置文件，并且 LaunchAgent 才会启动。
+脚本会把从 hostname 生成的建议设备名**预填进输入行**（macOS 终端用 readline），可直接回车确认，
+也可用方向键 / 退格修改后再回车。注册成功后，服务端返回的 `device_id` 会保存到配置文件，
+并且 LaunchAgent 才会启动。
 `password` 只允许使用 ASCII 字符，并且管理员应当配置足够长的随机密码或随机英文词组。
 
 旧配置中的 `api_key` 字段仍可读取，便于迁移；建议将该字段改名为 `password`。已有

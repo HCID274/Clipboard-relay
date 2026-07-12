@@ -1,2 +1,4 @@
 websocket-client
 pyperclip
+# Optional: enables readline-style device-name prefill on Windows consoles.
+# pyreadline3

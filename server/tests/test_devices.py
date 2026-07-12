@@ -180,15 +180,34 @@ def test_concurrent_registration_cannot_exceed_limit(
     assert len(relay_app.DEVICES) == 1
 
 
-def test_list_merges_persistent_records_with_online_state(client: TestClient) -> None:
+def test_list_merges_persistent_records_with_online_state(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     relay_app.DEVICES["mac-china"] = record("mac-china")
+    timestamps = iter(
+        [
+            "2026-07-11T01:00:00Z",  # 连接时持久化
+            "2026-07-11T02:00:00Z",  # 在线列表
+            "2026-07-11T03:00:00Z",  # 断开时持久化
+        ]
+    )
+    monkeypatch.setattr(relay_app, "_now", lambda: next(timestamps))
 
     with client.websocket_connect(
         "/ws/agent?device_id=mac-china", headers=headers()
     ):
         response = client.get("/api/devices", headers=headers())
 
-        assert response.json() == [{**record("mac-china"), "online": True}]
+        # 连接时已持久化为 01:00；列表对在线设备返回新鲜的「当前时间」。
+        assert response.json() == [
+            {
+                "device_id": "mac-china",
+                "created_at": INITIAL_TIMESTAMP,
+                "last_active": "2026-07-11T02:00:00Z",
+                "online": True,
+            }
+        ]
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
 
 
 def test_websocket_rejects_unregistered_device(client: TestClient) -> None:
@@ -274,25 +293,81 @@ def test_deleting_last_device_persists_empty_registry(client: TestClient) -> Non
     assert stored == {"devices": []}
 
 
-def test_last_active_changes_only_on_new_registration_and_disconnect(
+def test_last_active_updates_on_connect_and_disconnect(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    timestamps = iter(["2026-07-11T01:00:00Z", "2026-07-11T02:00:00Z"])
+    timestamps = iter(
+        [
+            "2026-07-11T01:00:00Z",  # 注册
+            "2026-07-11T02:00:00Z",  # 连接
+            "2026-07-11T03:00:00Z",  # 在线列表
+            "2026-07-11T04:00:00Z",  # 断开
+            "2026-07-11T05:00:00Z",  # 离线列表
+        ]
+    )
     monkeypatch.setattr(relay_app, "_now", lambda: next(timestamps))
 
     registered = client.post(
         "/api/devices/register", headers=headers(), json={"device_id": "mac-china"}
     ).json()
-    client.get("/api/devices", headers=headers())
+    offline_list = client.get("/api/devices", headers=headers()).json()
     client.get("/api/status", headers=headers())
 
     assert registered["last_active"] == "2026-07-11T01:00:00Z"
+    assert offline_list == [
+        {
+            "device_id": "mac-china",
+            "created_at": "2026-07-11T01:00:00Z",
+            "last_active": "2026-07-11T01:00:00Z",
+            "online": False,
+        }
+    ]
+
     with client.websocket_connect(
         "/ws/agent?device_id=mac-china", headers=headers()
     ):
-        assert relay_app.DEVICES["mac-china"]["last_active"] == registered["last_active"]
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
+        online_list = client.get("/api/devices", headers=headers()).json()
+        assert online_list[0]["online"] is True
+        assert online_list[0]["last_active"] == "2026-07-11T03:00:00Z"
+        # 列表接口的新鲜 last_active 不得回写设备清单文件。
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
+        stored_while_online = json.loads(
+            relay_app.DEVICES_FILE.read_text(encoding="utf-8")
+        )
+        assert stored_while_online["devices"][0]["last_active"] == "2026-07-11T02:00:00Z"
 
-    assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
+    assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T04:00:00Z"
+    offline_again = client.get("/api/devices", headers=headers()).json()
+    assert offline_again[0]["online"] is False
+    assert offline_again[0]["last_active"] == "2026-07-11T04:00:00Z"
+    stored = json.loads(relay_app.DEVICES_FILE.read_text(encoding="utf-8"))
+    assert stored["devices"][0]["last_active"] == "2026-07-11T04:00:00Z"
+
+
+def test_list_online_last_active_is_fresh_without_disk_write(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    timestamps = iter(
+        [
+            "2026-07-11T01:00:00Z",  # 连接时持久化
+            "2026-07-11T02:00:00Z",  # 第一次列表
+            "2026-07-11T03:00:00Z",  # 第二次列表
+            "2026-07-11T04:00:00Z",  # 断开时持久化
+        ]
+    )
+    monkeypatch.setattr(relay_app, "_now", lambda: next(timestamps))
+
+    with client.websocket_connect(
+        "/ws/agent?device_id=mac-china", headers=headers()
+    ):
+        first = client.get("/api/devices", headers=headers()).json()[0]
+        second = client.get("/api/devices", headers=headers()).json()[0]
+
+        assert first["last_active"] == "2026-07-11T02:00:00Z"
+        assert second["last_active"] == "2026-07-11T03:00:00Z"
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
 
 
 def test_send_failure_closes_connection_and_updates_offline_state(
@@ -390,7 +465,14 @@ def test_old_disconnect_cannot_update_last_active_after_same_device_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     relay_app.DEVICES["mac-china"] = record("mac-china")
-    monkeypatch.setattr(relay_app, "_now", lambda: "2026-07-11T01:00:00Z")
+    timestamps = iter(
+        [
+            "2026-07-11T01:00:00Z",  # 旧连接
+            "2026-07-11T02:00:00Z",  # 新连接
+            "2026-07-11T03:00:00Z",  # 新断开
+        ]
+    )
+    monkeypatch.setattr(relay_app, "_now", lambda: next(timestamps))
 
     class ReconnectingWebSocket:
         headers = {"x-api-key": NEW_PASSWORD}
@@ -417,6 +499,7 @@ def test_old_disconnect_cannot_update_last_active_after_same_device_reconnect(
         old_websocket = ReconnectingWebSocket(yield_on_close=True)
         old_task = asyncio.create_task(relay_app.websocket_agent(old_websocket))
         await old_websocket.connected.wait()
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T01:00:00Z"
 
         new_websocket = ReconnectingWebSocket()
         new_task = asyncio.create_task(relay_app.websocket_agent(new_websocket))
@@ -424,10 +507,13 @@ def test_old_disconnect_cannot_update_last_active_after_same_device_reconnect(
         await old_task
 
         assert relay_app.agents.websockets["mac-china"] is new_websocket
-        assert relay_app.DEVICES["mac-china"]["last_active"] == INITIAL_TIMESTAMP
+        # 新连接时间优先；被替换的旧连接不得覆盖。
+        # （若旧断开误写盘，会消耗下一个时间戳，使 last_active 超过新连接时间。）
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T02:00:00Z"
 
         new_websocket.disconnected.set()
         await new_task
+        assert relay_app.DEVICES["mac-china"]["last_active"] == "2026-07-11T03:00:00Z"
 
     asyncio.run(reconnect_then_disconnect())
 

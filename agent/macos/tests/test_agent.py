@@ -49,7 +49,8 @@ def test_registration_prompts_from_hostname_and_persists_server_device_id(
     config = register_configured_device(
         Config("wss://clip.hcid274.cn/ws/agent", "secret-key"),
         config_path,
-        prompt=lambda message: "" if "my-mac" in message else "unexpected",
+        # 可注入的 prompt：接收建议名并返回用户选定的 id。
+        prompt=lambda suggestion: suggestion,
         hostname="My Mac.local",
     )
 

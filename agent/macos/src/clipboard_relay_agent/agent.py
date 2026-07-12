@@ -5,7 +5,6 @@ import http.client
 import json
 import logging
 import os
-import re
 import socket
 import sys
 import time
@@ -16,7 +15,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 import pyperclip
@@ -29,6 +28,27 @@ from clipboard_relay_agent.config import (
     load_config,
     save_device_id,
 )
+
+# 源码态：共享包在 agent/clipboard_relay_shared；wheel 态：经 packages 打进 site-packages。
+def _ensure_shared_on_path() -> None:
+    try:
+        import clipboard_relay_shared  # noqa: F401
+        return
+    except ImportError:
+        pass
+    agent_root = Path(__file__).resolve().parents[3]
+    if agent_root.name == "agent" and str(agent_root) not in sys.path:
+        sys.path.insert(0, str(agent_root))
+
+
+_ensure_shared_on_path()
+
+from clipboard_relay_shared.device import (  # noqa: E402
+    build_agent_ws_url,
+    registration_url,
+    suggested_device_id,
+)
+from clipboard_relay_shared.prompt import prompt_device_id  # noqa: E402
 
 
 LOG_DIR = Path.home() / "Library" / "Logs" / "ClipboardRelay"
@@ -44,11 +64,10 @@ LOG_BACKUP_COUNT = 3
 STATIC_HOST_IPS = {
     "clip.hcid274.cn": "64.176.40.67",
 }
-DEVICE_ID_REPLACEMENT_PATTERN = re.compile(r"[^a-z0-9-]+")
 
 
 class RegistrationError(RuntimeError):
-    """Raised when the server rejects or cannot complete device registration."""
+    """服务端拒绝或无法完成设备注册时抛出。"""
 
 
 class StaticAddressHTTPSConnection(http.client.HTTPSConnection):
@@ -94,25 +113,6 @@ def build_connection_target(server_ws_url: str) -> ConnectionTarget:
 
 def build_headers(api_key: str) -> list[str]:
     return [f"X-API-Key: {api_key}"]
-
-
-def registration_url(server_ws_url: str) -> str:
-    parsed = urlparse(server_ws_url)
-    scheme = "https" if parsed.scheme == "wss" else "http"
-    return urlunparse((scheme, parsed.netloc, "/api/devices/register", "", "", ""))
-
-
-def build_agent_ws_url(server_ws_url: str, device_id: str) -> str:
-    parsed = urlparse(server_ws_url)
-    query = parse_qs(parsed.query)
-    query["device_id"] = [device_id]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-
-
-def suggested_device_id(hostname: str) -> str:
-    suggestion = DEVICE_ID_REPLACEMENT_PATTERN.sub("-", hostname.lower()).strip("-")
-    suggestion = suggestion[:32].rstrip("-")
-    return suggestion if len(suggestion) >= 3 else "my-device"
 
 
 def _registration_error(status_code: int, reason: str, body: bytes) -> RegistrationError:
@@ -176,17 +176,17 @@ def register_configured_device(
     config: Config,
     config_path: Path,
     *,
-    prompt: Callable[[str], str] = input,
+    prompt: Callable[[str], str] | None = None,
     hostname: str | None = None,
 ) -> Config:
     device_id = config.device_id
     if device_id is None:
         suggestion = suggested_device_id(hostname or socket.gethostname())
-        entered = prompt(f"设备名称 [{suggestion}]: ").strip()
-        device_id = entered or suggestion
+        # prompt 可在测试中注入；生产环境使用共享的预填交互。
+        device_id = (prompt or prompt_device_id)(suggestion)
 
     payload = send_registration_request(config.server_ws_url, config.api_key, device_id)
-    registered_id = payload.get("device_id") if isinstance(payload, dict) else None
+    registered_id = payload.get("device_id")
     if not isinstance(registered_id, str):
         raise RegistrationError("设备注册失败：服务端返回了无效响应")
     save_device_id(config_path, registered_id)
@@ -194,11 +194,8 @@ def register_configured_device(
 
 
 def extract_device_id(server_ws_url: str) -> str:
-    parsed = urlparse(server_ws_url)
-    device_ids = parse_qs(parsed.query).get("device_id")
-    if not device_ids:
-        return ""
-    return device_ids[0]
+    device_ids = parse_qs(urlparse(server_ws_url).query).get("device_id")
+    return device_ids[0] if device_ids else ""
 
 
 def update_status(

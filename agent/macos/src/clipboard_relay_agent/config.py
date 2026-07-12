@@ -17,7 +17,7 @@ PLACEHOLDER_PASSWORDS = frozenset(
 
 
 class ConfigError(RuntimeError):
-    """Raised when the agent cannot load a usable configuration."""
+    """无法加载可用配置时抛出。"""
 
 
 @dataclass(frozen=True)
@@ -65,18 +65,18 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
 
 
 def config_needs_password(path: Path) -> bool:
-    """Return whether a readable config needs a password to be supplied."""
+    """可读配置是否仍需要用户提供密码。"""
     raw = _load_raw_config(path)
     password_key = "password" if "password" in raw else "api_key"
     try:
         validate_password(raw.get(password_key), password_key)
+        return False
     except ConfigError:
         return True
-    return False
 
 
 def set_password(path: Path, password: str) -> None:
-    """Validate and persist a password without changing the other config values."""
+    """校验并写入密码，不改动配置中的其它字段。"""
     raw = _load_raw_config(path)
     raw["password"] = validate_password(password)
     _write_config(path, raw)

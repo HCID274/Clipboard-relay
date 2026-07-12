@@ -19,7 +19,8 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/clipboard_relay_agent"]
+# clipboard_relay_shared 经 src/ 下符号链接纳入，wheel 与源码态均可 import
+packages = ["src/clipboard_relay_agent", "src/clipboard_relay_shared"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

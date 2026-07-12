@@ -113,28 +113,57 @@ def _write_devices(devices: dict[str, dict[str, Any]] | None = None) -> None:
     _write_device_file(DEVICES_FILE, source)
 
 
+def _update_last_active(device_id: str, timestamp: str | None = None) -> None:
+    """更新内存中的 last_active，并尽量持久化到磁盘。
+
+    调用方须持有 device_lock。写盘失败只记日志、不抛异常，以便连接/断开流程仍能完成
+    （在线/离线状态仍正确）。
+    """
+    record = DEVICES.get(device_id)
+    if record is None:
+        return
+    record["last_active"] = _now() if timestamp is None else timestamp
+    try:
+        _write_devices()
+    except OSError as error:
+        LOGGER.warning(
+            "failed to persist last_active for device %s: %s",
+            device_id,
+            error,
+        )
+
+
+def _ascii_bytes(value: str) -> bytes | None:
+    try:
+        return value.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+
+
 def _credential_matches(candidate: str | None) -> bool:
     if candidate is None:
         return False
-    try:
-        candidate_bytes = candidate.strip().encode("ascii")
-    except UnicodeEncodeError:
+    candidate_bytes = _ascii_bytes(candidate.strip())
+    if candidate_bytes is None:
         return False
     for configured in (PASSWORD, API_KEY):
         configured = configured.strip()
         if not configured:
             continue
-        try:
-            configured_bytes = configured.encode("ascii")
-        except UnicodeEncodeError:
-            continue
-        if hmac.compare_digest(candidate_bytes, configured_bytes):
+        configured_bytes = _ascii_bytes(configured)
+        if configured_bytes is not None and hmac.compare_digest(
+            candidate_bytes, configured_bytes
+        ):
             return True
     return False
 
 
+def _auth_configured() -> bool:
+    return bool(PASSWORD.strip() or API_KEY.strip())
+
+
 def check_api_key(candidate: str | None) -> None:
-    if not PASSWORD.strip() and not API_KEY.strip():
+    if not _auth_configured():
         raise HTTPException(status_code=500, detail="RELAY_PASSWORD or API_KEY is not configured")
     if not _credential_matches(candidate):
         raise HTTPException(status_code=401, detail="invalid password")
@@ -236,10 +265,21 @@ async def list_devices(
 ) -> list[dict[str, Any]]:
     check_api_key(x_api_key)
     async with device_lock:
-        return [
-            {**record, "online": device_id in agents.websockets}
-            for device_id, record in sorted(DEVICES.items())
-        ]
+        # 在线设备在列表接口中报告「当前仍活跃」，但不因每次轮询写盘；
+        # 离线设备保留上次持久化的时间戳。
+        any_online = any(device_id in agents.websockets for device_id in DEVICES)
+        now = _now() if any_online else None
+        result: list[dict[str, Any]] = []
+        for device_id, record in sorted(DEVICES.items()):
+            online = device_id in agents.websockets
+            result.append(
+                {
+                    **record,
+                    "last_active": now if online else record["last_active"],
+                    "online": online,
+                }
+            )
+        return result
 
 
 @app.delete("/api/devices/{device_id}")
@@ -295,7 +335,7 @@ async def connection_status(
 @app.websocket("/ws/agent")
 async def websocket_agent(websocket: WebSocket) -> None:
     api_key = websocket.headers.get("x-api-key")
-    if not (PASSWORD.strip() or API_KEY.strip()) or not _credential_matches(api_key):
+    if not _auth_configured() or not _credential_matches(api_key):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     try:
@@ -308,25 +348,11 @@ async def websocket_agent(websocket: WebSocket) -> None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await agents.connect(device_id, websocket)
+        _update_last_active(device_id)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         async with device_lock:
             if agents.disconnect(device_id, websocket):
-                record = DEVICES.get(device_id)
-                if record is not None:
-                    last_active = _now()
-                    updated_devices = {
-                        key: value.copy() for key, value in DEVICES.items()
-                    }
-                    updated_devices[device_id]["last_active"] = last_active
-                    record["last_active"] = last_active
-                    try:
-                        _write_devices(updated_devices)
-                    except OSError as error:
-                        LOGGER.warning(
-                            "failed to persist last_active for device %s: %s",
-                            device_id,
-                            error,
-                        )
+                _update_last_active(device_id)

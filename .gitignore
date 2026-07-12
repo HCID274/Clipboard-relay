@@ -17,3 +17,4 @@ __pycache__/
 /agent/windows/config.json
 /agent/windows/.venv/
 /agent/windows/__pycache__/
+agent/macos/dist/

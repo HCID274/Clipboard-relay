@@ -32,12 +32,15 @@ HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
 ## 设备清单
 
 设备清单以 JSON 文件持久化，每条记录包含 `device_id`、`created_at` 和 `last_active`。
-文件写入采用同目录临时文件加原子替换。注册、删除和 WebSocket 断开更新使用同一把
+文件写入采用同目录临时文件加原子替换。注册、删除、WebSocket 连接成功与断开更新使用同一把
 `asyncio.Lock`。文件损坏时，服务端会记录警告并以空清单启动。
 
 `device_id` 会转换为小写，并且只允许 3 至 32 位小写字母、数字或连字符。仓库中的初始清单
-预置 `win-fukuoka` 与 `mac-china`，以支持旧设备平滑迁移。在线状态只保存在内存中，
-`last_active` 只在新设备注册成功和当前 WebSocket 断开时写入。
+预置 `win-fukuoka` 与 `mac-china`，以支持旧设备平滑迁移。在线状态只保存在内存中。
+`last_active` 在**新设备注册成功**、**当前 WebSocket 连接成功**以及**当前有效连接断开**时写入
+并持久化；已存在设备再次调用注册接口不会刷新 `last_active`。
+`GET /api/devices` 对 `online: true` 的设备返回**当前时间**作为 `last_active`（只读展示，
+不写盘），以便页面轮询时可见“仍在活跃”；离线设备返回文件中持久化的时间戳。
 
 ## HTTP 接口
 
@@ -53,7 +56,9 @@ HTTP 返回 `401`，WebSocket 以 `1008` 关闭。
 
 ### `GET /api/devices`
 
-该接口返回持久字段和实时在线状态：
+该接口返回持久字段和实时在线状态。当 `online` 为 `true` 时，响应中的 `last_active` 为
+请求时刻的服务器当前时间（不写盘）；离线设备的 `last_active` 为最近一次注册 / 连接 /
+断开时持久化的值。
 
 ```json
 [
@@ -97,8 +102,10 @@ wss://clip.hcid274.cn/ws/agent?device_id=<已注册设备 ID>
 {"type":"clipboard","text":"..."}
 ```
 
-服务端通过 `receive_text()` 检测断线。只有当前有效连接断开时，服务端才会移除内存连接并更新
-该设备的 `last_active`，被同名新连接替换的旧连接不会覆盖当前状态。
+WebSocket 连接成功（accept 且设备已注册）后，服务端立即更新并持久化该设备的 `last_active`。
+服务端通过 `receive_text()` 检测断线。只有当前有效连接断开时，服务端才会移除内存连接并再次
+更新该设备的 `last_active`；被同名新连接替换的旧连接不会覆盖当前状态（包括新连接写入的
+`last_active`）。
 
 ## Agent 首次配置
 

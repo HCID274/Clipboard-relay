@@ -119,10 +119,14 @@ def test_registration_prompts_with_hostname_and_persists_server_identity(
         return Response()
 
     monkeypatch.setattr(agent.socket, "gethostname", lambda: "WIN OFFICE.local")
-    monkeypatch.setattr("builtins.input", lambda message: "" if "win-office-local" in message else "bad")
+    # 可注入的 prompt：接收建议名并返回用户选定的 id。
     monkeypatch.setattr(agent, "urlopen", open_request)
 
-    config = agent.register_configured_device(agent.load_config(config_path), config_path)
+    config = agent.register_configured_device(
+        agent.load_config(config_path),
+        config_path,
+        prompt=lambda suggestion: suggestion,
+    )
 
     assert config["device_id"] == "win-office"
     assert config["server_ws_url"].endswith("device_id=win-office")
