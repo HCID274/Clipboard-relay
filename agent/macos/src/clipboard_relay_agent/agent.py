@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import logging
 import os
@@ -9,13 +8,13 @@ import socket
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 import pyperclip
@@ -64,9 +63,6 @@ LOG_MAX_BYTES = 1_048_576
 LOG_BACKUP_COUNT = 3
 # 与 Windows Agent 一致：安装脚本用此退出码识别「密码错误并已/应清本地密码」。
 AUTHENTICATION_FAILURE_EXIT_CODE = 3
-STATIC_HOST_IPS = {
-    "clip.hcid274.cn": "64.176.40.67",
-}
 
 
 class RegistrationError(RuntimeError):
@@ -75,47 +71,6 @@ class RegistrationError(RuntimeError):
 
 class AuthenticationError(RegistrationError):
     """共享密码校验失败（HTTP 401）时抛出。"""
-
-
-class StaticAddressHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, connect_host: str, tls_host: str, port: int, timeout: int) -> None:
-        super().__init__(tls_host, port=port, timeout=timeout)
-        self.connect_host = connect_host
-
-    def connect(self) -> None:
-        self.sock = socket.create_connection(
-            (self.connect_host, self.port), self.timeout, self.source_address
-        )
-        if self._tunnel_host:
-            self._tunnel()
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
-
-
-@dataclass(frozen=True)
-class ConnectionTarget:
-    url: str
-    host: str | None
-    sslopt: dict[str, str] | None
-
-
-def build_connection_target(server_ws_url: str) -> ConnectionTarget:
-    parsed = urlparse(server_ws_url)
-    hostname = parsed.hostname
-    if hostname is None:
-        return ConnectionTarget(url=server_ws_url, host=None, sslopt=None)
-
-    static_ip = STATIC_HOST_IPS.get(hostname)
-    if static_ip is None:
-        return ConnectionTarget(url=server_ws_url, host=None, sslopt=None)
-
-    netloc = f"{static_ip}:{parsed.port}" if parsed.port is not None else static_ip
-
-    rewritten_url = urlunparse(parsed._replace(netloc=netloc))
-    return ConnectionTarget(
-        url=rewritten_url,
-        host=parsed.netloc,
-        sslopt={"server_hostname": hostname},
-    )
 
 
 def build_headers(api_key: str) -> list[str]:
@@ -135,45 +90,22 @@ def _registration_error(status_code: int, reason: str, body: bytes) -> Registrat
 def send_registration_request(
     server_ws_url: str, password: str, device_id: str
 ) -> dict[str, Any]:
+    """向服务端注册设备；只使用配置里的域名 URL，不做 IP 硬编码。"""
     url = registration_url(server_ws_url)
-    parsed = urlparse(url)
     body = json.dumps({"device_id": device_id}).encode("utf-8")
     headers = {"Content-Type": "application/json", "X-API-Key": password}
-    static_ip = STATIC_HOST_IPS.get(parsed.hostname or "")
 
     try:
-        if parsed.scheme == "https" and static_ip is not None and parsed.hostname is not None:
-            connection = StaticAddressHTTPSConnection(
-                static_ip,
-                parsed.hostname,
-                parsed.port or 443,
-                CONNECT_TIMEOUT_SECONDS,
-            )
-            try:
-                connection.request("POST", parsed.path, body=body, headers=headers)
-                response = connection.getresponse()
+        request = Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=CONNECT_TIMEOUT_SECONDS) as response:
                 response_body = response.read()
-                if response.status >= 400:
-                    raise _registration_error(response.status, response.reason, response_body)
-            finally:
-                connection.close()
-        else:
-            request = Request(url, data=body, headers=headers, method="POST")
-            try:
-                with urlopen(request, timeout=CONNECT_TIMEOUT_SECONDS) as response:
-                    response_body = response.read()
-            except HTTPError as exc:
-                raise _registration_error(exc.code, exc.reason, exc.read()) from exc
+        except HTTPError as exc:
+            raise _registration_error(exc.code, exc.reason, exc.read()) from exc
         payload = json.loads(response_body.decode("utf-8"))
     except RegistrationError:
         raise
-    except (
-        OSError,
-        URLError,
-        http.client.HTTPException,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ) as exc:
+    except (OSError, URLError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RegistrationError(f"设备注册失败：{exc}") from exc
 
     if not isinstance(payload, dict):
@@ -330,7 +262,6 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
         current_reconnect_attempts = reconnect_attempts
         device_id = config.device_id or extract_device_id(config.server_ws_url)
         websocket_url = build_agent_ws_url(config.server_ws_url, device_id)
-        connection_target = build_connection_target(websocket_url)
 
         def on_open(_ws: websocket.WebSocketApp) -> None:
             logger.info("connected to %s", websocket_url)
@@ -376,8 +307,9 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
                 last_close_reason=reason,
             )
 
+        # 只使用配置中的域名 WSS URL；分流/直连交给本机代理（Clash）规则。
         ws = websocket.WebSocketApp(
-            connection_target.url,
+            websocket_url,
             header=build_headers(config.api_key),
             on_open=on_open,
             on_message=on_message,
@@ -390,10 +322,6 @@ def run_agent(config: Config, logger: logging.Logger) -> None:
             "ping_timeout": PING_TIMEOUT_SECONDS,
             "skip_utf8_validation": True,
         }
-        if connection_target.host is not None:
-            run_options["host"] = connection_target.host
-        if connection_target.sslopt is not None:
-            run_options["sslopt"] = connection_target.sslopt
 
         try:
             ws.run_forever(**run_options)

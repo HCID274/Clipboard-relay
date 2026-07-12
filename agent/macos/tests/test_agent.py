@@ -9,7 +9,6 @@ from clipboard_relay_agent.agent import (
     AUTHENTICATION_FAILURE_EXIT_CODE,
     AuthenticationError,
     RegistrationError,
-    build_connection_target,
     build_headers,
     configure_logging,
     handle_message,
@@ -180,87 +179,6 @@ def test_main_authentication_failure_clears_password_and_uses_exit_code_3(
     assert saved["device_id"] == "mac-office"
 
 
-def test_registration_uses_static_ip_with_original_http_host_and_tls_name(
-    monkeypatch,
-) -> None:
-    calls = []
-
-    class Response:
-        status = 200
-        reason = "OK"
-
-        def read(self):
-            return b'{"device_id":"mac-china"}'
-
-    class Connection:
-        def __init__(self, connect_host, tls_host, port, timeout):
-            calls.append(("connect", connect_host, tls_host, port, timeout))
-
-        def request(self, method, path, body, headers):
-            calls.append(("request", method, path, json.loads(body), headers))
-
-        def getresponse(self):
-            return Response()
-
-        def close(self):
-            calls.append(("close",))
-
-    monkeypatch.setattr(agent_module, "StaticAddressHTTPSConnection", Connection)
-
-    payload = send_registration_request(
-        "wss://clip.hcid274.cn/ws/agent", "secret-key", "mac-china"
-    )
-
-    assert payload == {"device_id": "mac-china"}
-    assert calls[0] == ("connect", "64.176.40.67", "clip.hcid274.cn", 443, 8)
-    assert calls[1][0:3] == ("request", "POST", "/api/devices/register")
-    assert calls[1][3] == {"device_id": "mac-china"}
-    assert calls[1][4]["X-API-Key"] == "secret-key"
-
-
-def test_static_ip_registration_http_401_raises_authentication_error(monkeypatch) -> None:
-    """生产域名走静态 IP 连接时，401 也必须映射为 AuthenticationError。"""
-
-    class Response:
-        status = 401
-        reason = "Unauthorized"
-
-        def read(self):
-            return b'{"detail":"invalid password"}'
-
-    class Connection:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def request(self, *_args, **_kwargs):
-            return None
-
-        def getresponse(self):
-            return Response()
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(agent_module, "StaticAddressHTTPSConnection", Connection)
-
-    try:
-        send_registration_request(
-            "wss://clip.hcid274.cn/ws/agent", "wrong-password", "mac-china"
-        )
-        raise AssertionError("expected AuthenticationError")
-    except AuthenticationError as exc:
-        assert "401" in str(exc)
-        assert "invalid password" in str(exc)
-
-
-def test_build_connection_target_uses_static_ip_with_original_host_and_sni() -> None:
-    target = build_connection_target("wss://clip.hcid274.cn/ws/agent?device_id=mac-china")
-
-    assert target.url == "wss://64.176.40.67/ws/agent?device_id=mac-china"
-    assert target.host == "clip.hcid274.cn"
-    assert target.sslopt == {"server_hostname": "clip.hcid274.cn"}
-
-
 def test_handle_message_copies_clipboard_text_without_logging_body(caplog) -> None:
     copied = []
 
@@ -409,8 +327,6 @@ def test_run_agent_enables_websocket_heartbeat(monkeypatch) -> None:
             "ping_interval": 30,
             "ping_timeout": 10,
             "skip_utf8_validation": True,
-            "host": "clip.hcid274.cn",
-            "sslopt": {"server_hostname": "clip.hcid274.cn"},
         }
     ]
 
