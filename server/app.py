@@ -195,9 +195,11 @@ def _is_websocket_not_connected_error(error: RuntimeError) -> bool:
 
 
 # 应用层 RTT：服务端发 ping、Agent 回 pong；列表接口返回缓存的 latency_ms。
-# 探测周期和超时均保持在一秒以内，以便半开连接不会长期显示为在线。
-LATENCY_PROBE_INTERVAL_SECONDS = 0.75
-LATENCY_PROBE_TIMEOUT_SECONDS = 0.75
+# 测速（软）与判死（硬）分离：单次超时只清空 RTT；连续失败才踢半开连接。
+# 间隔约 1s 保证 UI 刷新体感；超时放宽以容纳跨境抖动（见社区心跳惯例）。
+LATENCY_PROBE_INTERVAL_SECONDS = 1.0
+LATENCY_PROBE_TIMEOUT_SECONDS = 3.0
+LATENCY_PROBE_MAX_FAILURES = 3
 UI_TICKET_TTL_SECONDS = 60.0
 MAX_UI_CLIENTS = 32
 
@@ -338,6 +340,8 @@ class AgentConnections:
         self.latency_ms: dict[str, int | None] = {}
         # 每台设备最多一个进行中的测速；键为 device_id。
         self._pending_pings: dict[str, _PendingPing] = {}
+        # 连续测速失败次数；成功清零，达到阈值才踢连接。
+        self._probe_failures: dict[str, int] = {}
 
     def _cancel_pending(self, device_id: str) -> None:
         pending = self._pending_pings.pop(device_id, None)
@@ -348,12 +352,16 @@ class AgentConnections:
         self._cancel_pending(device_id)
         self.latency_ms[device_id] = None
 
+    def _reset_probe_failures(self, device_id: str) -> None:
+        self._probe_failures.pop(device_id, None)
+
     async def connect(self, device_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
         old_websocket = self.websockets.get(device_id)
         # 必须先作废探测并切换表项，再 await close 旧连接。
         # 若先 close，await 让出期间旧连接的匹配 pong 仍可能完成旧探测。
         self._clear_latency_state(device_id)
+        self._reset_probe_failures(device_id)
         self.websockets[device_id] = websocket
         if old_websocket is not None and old_websocket is not websocket:
             try:
@@ -370,11 +378,13 @@ class AgentConnections:
             return False
         self.websockets.pop(device_id, None)
         self._clear_latency_state(device_id)
+        self._reset_probe_failures(device_id)
         return True
 
     async def remove(self, device_id: str) -> None:
         websocket = self.websockets.pop(device_id, None)
         self._clear_latency_state(device_id)
+        self._reset_probe_failures(device_id)
         if websocket is not None:
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
 
@@ -464,6 +474,7 @@ class AgentConnections:
                 return None
             ms = max(0, int(round((time.perf_counter() - sent_at) * 1000)))
             self.latency_ms[device_id] = ms
+            self._probe_failures[device_id] = 0
             await publish_device_snapshot()
             return ms
         except asyncio.CancelledError:
@@ -472,10 +483,19 @@ class AgentConnections:
                 self.latency_ms[device_id] = None
             return None
         except Exception:
-            # 超时或发送失败不仅清除 RTT，还要撤销连接，避免半开 Agent 假在线。
+            # 单次超时：只清 RTT 并计数；连续失败才踢，避免跨境抖动误杀在线 Agent。
             if self.websockets.get(device_id) is websocket:
                 self.latency_ms[device_id] = None
-                await mark_agent_unavailable(device_id, websocket)
+                failures = self._probe_failures.get(device_id, 0) + 1
+                self._probe_failures[device_id] = failures
+                await publish_device_snapshot()
+                if failures >= LATENCY_PROBE_MAX_FAILURES:
+                    LOGGER.warning(
+                        "agent %s probe failed %s times; marking unavailable",
+                        device_id,
+                        failures,
+                    )
+                    await mark_agent_unavailable(device_id, websocket)
             return None
         finally:
             if self._pending_pings.get(device_id) is pending:
@@ -544,7 +564,7 @@ async def _latency_probe_loop() -> None:
             if not online_ids:
                 continue
             for device_id in online_ids:
-                # measure_latency 会自行拒绝重叠探测；每轮不等待超时，周期保持不超过一秒。
+                # measure_latency 会自行拒绝重叠探测；每轮 fire-and-forget，间隔由 sleep 控制。
                 asyncio.create_task(
                     agents.measure_latency(device_id), name=f"latency-{device_id}"
                 )

@@ -25,6 +25,7 @@ def clear_server_state() -> None:
     relay_app.agents.websockets.clear()
     relay_app.agents.latency_ms.clear()
     relay_app.agents._pending_pings.clear()
+    relay_app.agents._probe_failures.clear()
     relay_app.ui_tickets._tickets.clear()
     relay_app.ui_clients._clients.clear()
     relay_app.device_state_version = 0
@@ -238,7 +239,8 @@ def test_ui_receives_registration_and_agent_connect_disconnect_snapshots(
         assert deleted_snapshot["devices"] == []
 
 
-def test_probe_timeout_marks_agent_offline_and_closes_socket() -> None:
+def test_single_probe_timeout_keeps_agent_online_and_clears_latency() -> None:
+    """单次超时只清空 RTT，不立刻踢连接。"""
     relay_app.DEVICES["mac-china"] = record("mac-china")
 
     class SilentWebSocket:
@@ -254,17 +256,47 @@ def test_probe_timeout_marks_agent_offline_and_closes_socket() -> None:
     async def measure_timeout() -> SilentWebSocket:
         websocket = SilentWebSocket()
         relay_app.agents.websockets["mac-china"] = websocket  # type: ignore[assignment]
+        relay_app.agents.latency_ms["mac-china"] = 42
         assert await relay_app.agents.measure_latency("mac-china", timeout=0.01) is None
         return websocket
 
     websocket = asyncio.run(measure_timeout())
 
+    assert "mac-china" in relay_app.agents.websockets
+    assert relay_app.agents.latency_ms["mac-china"] is None
+    assert relay_app.agents._probe_failures["mac-china"] == 1
+    assert websocket.close_codes == []
+
+
+def test_consecutive_probe_timeouts_mark_agent_offline_and_close_socket() -> None:
+    """连续失败达到阈值后才关闭半开连接。"""
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+
+    class SilentWebSocket:
+        def __init__(self) -> None:
+            self.close_codes: list[int] = []
+
+        async def send_json(self, _payload: dict) -> None:
+            return None
+
+        async def close(self, code: int) -> None:
+            self.close_codes.append(code)
+
+    async def measure_until_kick() -> SilentWebSocket:
+        websocket = SilentWebSocket()
+        relay_app.agents.websockets["mac-china"] = websocket  # type: ignore[assignment]
+        for _ in range(relay_app.LATENCY_PROBE_MAX_FAILURES):
+            assert await relay_app.agents.measure_latency("mac-china", timeout=0.01) is None
+        return websocket
+
+    websocket = asyncio.run(measure_until_kick())
+
     assert "mac-china" not in relay_app.agents.websockets
     assert websocket.close_codes == [1011]
 
 
-def test_probe_timeout_during_blocked_ping_send_marks_agent_offline() -> None:
-    """ping 发送在半开连接中阻塞时，探测也必须在预算内下线该设备。"""
+def test_probe_timeout_during_blocked_ping_send_counts_failure() -> None:
+    """ping 发送在半开连接中阻塞时，探测超时计入失败，单次不踢。"""
     relay_app.DEVICES["mac-china"] = record("mac-china")
 
     class BlockingSendWebSocket:
@@ -288,8 +320,9 @@ def test_probe_timeout_during_blocked_ping_send_marks_agent_offline() -> None:
 
     websocket = asyncio.run(measure_timeout())
 
-    assert "mac-china" not in relay_app.agents.websockets
-    assert websocket.close_codes == [1011]
+    assert "mac-china" in relay_app.agents.websockets
+    assert relay_app.agents._probe_failures["mac-china"] == 1
+    assert websocket.close_codes == []
 
 
 def test_latency_probe_does_not_overlap_for_one_device() -> None:

@@ -33,11 +33,13 @@ def reset_server_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     relay_app.agents.websockets.clear()
     relay_app.agents.latency_ms.clear()
     relay_app.agents._pending_pings.clear()
+    relay_app.agents._probe_failures.clear()
     yield
     relay_app.DEVICES.clear()
     relay_app.agents.websockets.clear()
     relay_app.agents.latency_ms.clear()
     relay_app.agents._pending_pings.clear()
+    relay_app.agents._probe_failures.clear()
 
 
 @pytest.fixture
@@ -625,6 +627,30 @@ def test_measure_latency_times_out_without_pong() -> None:
 
     assert ms is None
     assert relay_app.agents.latency_ms["mac-china"] is None
+    # 单次超时仍保持在线，仅累计失败次数。
+    assert "mac-china" in relay_app.agents.websockets
+    assert relay_app.agents._probe_failures["mac-china"] == 1
+
+
+def test_successful_probe_resets_failure_counter() -> None:
+    class PongWebSocket:
+        async def send_json(self, payload: dict) -> None:
+            relay_app.agents.handle_agent_text(
+                "mac-china",
+                json.dumps({"type": "pong", "id": payload.get("id"), "t": payload.get("t")}),
+                self,  # type: ignore[arg-type]
+            )
+
+    async def run() -> int | None:
+        fake = PongWebSocket()
+        relay_app.agents.websockets["mac-china"] = fake  # type: ignore[assignment]
+        relay_app.agents._probe_failures["mac-china"] = 2
+        return await relay_app.agents.measure_latency("mac-china", timeout=1.0)
+
+    ms = asyncio.run(run())
+
+    assert isinstance(ms, int)
+    assert relay_app.agents._probe_failures["mac-china"] == 0
 
 
 def test_send_failure_closes_connection_and_updates_offline_state(
