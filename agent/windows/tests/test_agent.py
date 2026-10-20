@@ -1,6 +1,10 @@
+import ctypes
 import io
 import json
+import sys
 import logging
+import threading
+import time
 from logging.handlers import RotatingFileHandler
 from urllib.error import HTTPError
 
@@ -293,6 +297,8 @@ def test_run_sets_websocket_timeout_and_heartbeat(monkeypatch, tmp_path) -> None
             raise KeyboardInterrupt
 
     monkeypatch.setattr(agent, "setup_logging", lambda: None)
+    monkeypatch.setattr(agent, "raise_process_priority", lambda: None)
+    monkeypatch.setattr(agent, "start_clipboard_worker", lambda: None)
     monkeypatch.setattr(agent, "register_configured_device", lambda config, *_args: config)
     monkeypatch.setattr(agent.websocket, "setdefaulttimeout", timeouts.append)
     monkeypatch.setattr(agent.websocket, "WebSocketApp", InterruptingWebSocketApp)
@@ -308,6 +314,95 @@ def test_run_sets_websocket_timeout_and_heartbeat(monkeypatch, tmp_path) -> None
             "skip_utf8_validation": True,
         }
     ]
+
+
+def test_run_retries_registration_until_network_recovers(monkeypatch, tmp_path) -> None:
+    """后台运行时注册失败（网络没通）要一直重试，不能退出。"""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_ws_url": "wss://clip.hcid274.cn/ws/agent",
+                "password": "secret-password",
+                "device_id": "win-office",
+            }
+        ),
+        encoding="utf-8",
+    )
+    attempts = []
+    sleeps = []
+
+    def flaky_register(config, *_args):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise agent.RegistrationError("设备注册失败：timed out")
+        return config
+
+    class InterruptingWebSocketApp:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def run_forever(self, **_kwargs) -> None:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "setup_logging", lambda: None)
+    monkeypatch.setattr(agent, "raise_process_priority", lambda: None)
+    monkeypatch.setattr(agent, "start_clipboard_worker", lambda: None)
+    monkeypatch.setattr(agent, "register_configured_device", flaky_register)
+    monkeypatch.setattr(agent.time, "sleep", sleeps.append)
+    monkeypatch.setattr(agent.websocket, "WebSocketApp", InterruptingWebSocketApp)
+
+    agent.run(config_path=config_path)
+
+    assert len(attempts) == 3
+    assert sleeps == [agent.REGISTRATION_RETRY_MIN_SECONDS, agent.REGISTRATION_RETRY_MIN_SECONDS * 2]
+
+
+def test_slow_clipboard_write_does_not_block_pong(monkeypatch) -> None:
+    """写剪贴板卡住时，收消息线程仍要立刻回 pong。"""
+    release = threading.Event()
+    copied = []
+
+    def slow_copy(text: str) -> None:
+        release.wait(5)
+        copied.append(text)
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.sent = []
+
+        def send(self, data: str) -> None:
+            self.sent.append(json.loads(data))
+
+    monkeypatch.setattr(agent.pyperclip, "copy", slow_copy)
+    agent.start_clipboard_worker()
+    app = FakeApp()
+
+    started = time.monotonic()
+    agent.on_message(app, json.dumps({"type": "clipboard", "text": "hello"}))
+    agent.on_message(app, json.dumps({"type": "ping", "id": "p1", "t": 1}))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert app.sent == [{"type": "pong", "t": 1, "id": "p1"}]
+    release.set()
+    agent._clipboard_queue.join()
+    assert copied == ["hello"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_raise_process_priority_takes_effect() -> None:
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetPriorityClass.argtypes = (ctypes.c_void_p,)
+    kernel32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    handle = kernel32.GetCurrentProcess()
+    original = kernel32.GetPriorityClass(handle)
+    try:
+        agent.raise_process_priority()
+        assert kernel32.GetPriorityClass(handle) == agent.ABOVE_NORMAL_PRIORITY_CLASS
+    finally:
+        kernel32.SetPriorityClass(handle, original)
 
 
 def test_build_pong_reply_echoes_ping_fields() -> None:

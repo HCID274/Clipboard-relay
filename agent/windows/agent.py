@@ -1,9 +1,12 @@
 import argparse
+import ctypes
 import json
 import logging
 import os
+import queue
 import socket
 import sys
+import threading
 import time
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
@@ -40,6 +43,10 @@ PLACEHOLDER_PASSWORDS = frozenset(
     {"replace-with-shared-key", "replace-with-relay-password"}
 )
 AUTHENTICATION_FAILURE_EXIT_CODE = 3
+# 计划任务默认以“低于正常”启动；本机 CPU 跑满时 pong 迟到 9 秒以上，服务端就会以 1011 踢线。
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+REGISTRATION_RETRY_MIN_SECONDS = 5.0
+REGISTRATION_RETRY_MAX_SECONDS = 60.0
 
 
 class RegistrationError(RuntimeError):
@@ -118,6 +125,20 @@ def setup_logging() -> None:
         force=True,
     )
     logging.info("%s starting, log=%s", TASK_NAME, log_path)
+
+
+def raise_process_priority() -> None:
+    """把本进程提到“高于正常”，让心跳在本机满载时仍能按时回复。"""
+    if sys.platform != "win32":
+        return
+    kernel32 = ctypes.windll.kernel32
+    # 不声明类型时 ctypes 把伪句柄 -1 截成 32 位，调用会报 ERROR_INVALID_HANDLE。
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    if kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS):
+        logging.info("process priority set to above normal")
+    else:
+        logging.warning("failed to raise process priority: error=%s", ctypes.GetLastError())
 
 
 def load_config(config_path: Path | None = None) -> dict[str, Any]:
@@ -293,6 +314,11 @@ def on_message(ws_app: websocket.WebSocketApp, message: str) -> None:
         return
 
     logging.info("received clipboard text length=%d", len(text))
+    # 写剪贴板可能被别的程序占住十几秒；放到单独线程，收消息线程才能继续回 pong。
+    _clipboard_queue.put((ws_app, text))
+
+
+def write_clipboard(ws_app: websocket.WebSocketApp, text: str) -> None:
     try:
         pyperclip.copy(text)
     except Exception:
@@ -304,6 +330,27 @@ def on_message(ws_app: websocket.WebSocketApp, message: str) -> None:
         return
 
     logging.info("clipboard write succeeded length=%d", len(text))
+
+
+_clipboard_queue: queue.Queue[tuple[websocket.WebSocketApp, str]] = queue.Queue()
+
+
+def _clipboard_worker() -> None:
+    """按收到的顺序逐条写剪贴板。"""
+    while True:
+        ws_app, text = _clipboard_queue.get()
+        try:
+            write_clipboard(ws_app, text)
+        except Exception:
+            logging.exception("clipboard worker failed")
+        finally:
+            _clipboard_queue.task_done()
+
+
+def start_clipboard_worker() -> threading.Thread:
+    worker = threading.Thread(target=_clipboard_worker, name="clipboard-writer", daemon=True)
+    worker.start()
+    return worker
 
 
 def on_error(ws_app: websocket.WebSocketApp, error: Any) -> None:
@@ -324,23 +371,34 @@ def on_close(
 
 def run(*, register_only: bool = False, config_path: Path | None = None) -> None:
     setup_logging()
+    if not register_only:
+        raise_process_priority()
+        start_clipboard_worker()
     websocket.setdefaulttimeout(CONNECT_TIMEOUT_SECONDS)
     active_config_path = config_path or get_config_path()
     config = load_config(active_config_path)
-    try:
-        config = register_configured_device(config, active_config_path)
-    except AuthenticationError as exc:
-        logging.error("%s", exc)
-        print(str(exc), file=sys.stderr)
+    retry_seconds = REGISTRATION_RETRY_MIN_SECONDS
+    while True:
         try:
-            clear_password(active_config_path)
-        except (OSError, ValueError, json.JSONDecodeError) as clear_exc:
-            logging.error("failed to clear rejected password: %s", clear_exc)
-        raise SystemExit(AUTHENTICATION_FAILURE_EXIT_CODE) from exc
-    except RegistrationError as exc:
-        logging.error("%s", exc)
-        print(str(exc), file=sys.stderr)
-        raise SystemExit(1) from exc
+            config = register_configured_device(config, active_config_path)
+            break
+        except AuthenticationError as exc:
+            logging.error("%s", exc)
+            print(str(exc), file=sys.stderr)
+            try:
+                clear_password(active_config_path)
+            except (OSError, ValueError, json.JSONDecodeError) as clear_exc:
+                logging.error("failed to clear rejected password: %s", clear_exc)
+            raise SystemExit(AUTHENTICATION_FAILURE_EXIT_CODE) from exc
+        except RegistrationError as exc:
+            logging.error("%s", exc)
+            print(str(exc), file=sys.stderr)
+            if register_only:
+                raise SystemExit(1) from exc
+            # 后台运行时网络没通（刚登录、断网、服务端重启）不能退出，否则要等下次登录才恢复。
+            logging.info("retrying registration in %.0f seconds", retry_seconds)
+            time.sleep(retry_seconds)
+            retry_seconds = min(retry_seconds * 2, REGISTRATION_RETRY_MAX_SECONDS)
     if register_only:
         print(f"设备 {config['device_id']} 注册成功。")
         return
