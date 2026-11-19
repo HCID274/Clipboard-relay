@@ -82,13 +82,21 @@ def _load_devices(path: Path) -> dict[str, dict[str, Any]]:
                 raise ValueError("device record has an invalid device_id")
             created_at = record.get("created_at")
             last_active = record.get("last_active")
-            if not isinstance(created_at, str) or not isinstance(last_active, str):
+            last_sent_at = record.get("last_sent_at")
+            if (
+                not isinstance(created_at, str)
+                or not isinstance(last_active, str)
+                or (last_sent_at is not None and not isinstance(last_sent_at, str))
+            ):
                 raise ValueError("device record has invalid timestamps")
-            devices[device_id] = {
+            normalized_record = {
                 "device_id": device_id,
                 "created_at": created_at,
                 "last_active": last_active,
             }
+            if last_sent_at is not None:
+                normalized_record["last_sent_at"] = last_sent_at
+            devices[device_id] = normalized_record
         return devices
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         LOGGER.warning("failed to load device registry %s; starting empty: %s", path, exc)
@@ -118,6 +126,13 @@ def _write_devices(devices: dict[str, dict[str, Any]] | None = None) -> None:
     _write_device_file(DEVICES_FILE, source)
 
 
+def _public_device_record(record: dict[str, Any]) -> dict[str, Any]:
+    """返回 API/UI 使用的设备记录，不暴露内部排序元数据。"""
+    public_record = record.copy()
+    public_record.pop("last_sent_at", None)
+    return public_record
+
+
 def _update_last_active(device_id: str, timestamp: str | None = None) -> None:
     """更新内存中的 last_active，并尽量持久化到磁盘。
 
@@ -133,6 +148,27 @@ def _update_last_active(device_id: str, timestamp: str | None = None) -> None:
     except OSError as error:
         LOGGER.warning(
             "failed to persist last_active for device %s: %s",
+            device_id,
+            error,
+        )
+
+
+def _now_millis() -> str:
+    """生成可用于最近发送排序的毫秒级 UTC 时间戳。"""
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _record_last_sent(device_id: str, timestamp: str | None = None) -> None:
+    """记录最近一次成功发送；写盘失败不影响已经完成的发送。"""
+    record = DEVICES.get(device_id)
+    if record is None:
+        return
+    record["last_sent_at"] = _now_millis() if timestamp is None else timestamp
+    try:
+        _write_devices()
+    except OSError as error:
+        LOGGER.warning(
+            "failed to persist last_sent_at for device %s: %s",
             device_id,
             error,
         )
@@ -512,11 +548,29 @@ def _device_records_locked(*, fresh_online_last_active: bool = True) -> list[dic
     any_online = any(device_id in agents.websockets for device_id in DEVICES)
     now = _now() if fresh_online_last_active and any_online else None
     records: list[dict[str, Any]] = []
-    for device_id, record in sorted(DEVICES.items()):
+    sent_devices = sorted(
+        (
+            (device_id, record)
+            for device_id, record in DEVICES.items()
+            if isinstance(record.get("last_sent_at"), str)
+        ),
+        key=lambda item: (item[1]["last_sent_at"], item[0]),
+        reverse=True,
+    )
+    unsent_devices = sorted(
+        (
+            (device_id, record)
+            for device_id, record in DEVICES.items()
+            if not isinstance(record.get("last_sent_at"), str)
+        ),
+        key=lambda item: item[0],
+    )
+    for device_id, record in [*sent_devices, *unsent_devices]:
         online = device_id in agents.websockets
+        public_record = _public_device_record(record)
         records.append(
             {
-                **record,
+                **public_record,
                 "last_active": now if online and now is not None else record["last_active"],
                 "online": online,
                 "latency_ms": agents.latency_ms.get(device_id) if online else None,
@@ -620,7 +674,7 @@ async def register_device(
     async with device_lock:
         existing = DEVICES.get(device_id)
         if existing is not None:
-            return existing.copy()
+            return _public_device_record(existing)
         if len(DEVICES) >= MAX_DEVICES:
             raise HTTPException(status_code=403, detail="已达设备数上限")
         timestamp = _now()
@@ -632,7 +686,7 @@ async def register_device(
         updated_devices = {**DEVICES, device_id: record}
         _write_devices(updated_devices)
         DEVICES[device_id] = record
-        created_record = record.copy()
+        created_record = _public_device_record(record)
     await publish_device_snapshot()
     return created_record
 
@@ -681,6 +735,9 @@ async def send_text(
         await agents.send_clipboard(target, text)
     except RuntimeError:
         raise HTTPException(status_code=503, detail="target device is not connected")
+    async with device_lock:
+        _record_last_sent(target)
+    await publish_device_snapshot()
     return {"ok": True}
 
 

@@ -456,6 +456,75 @@ def test_list_devices_includes_cached_latency_ms(client: TestClient) -> None:
     assert by_id["win-fukuoka"]["latency_ms"] is None
 
 
+def test_successful_send_records_last_sent_and_reorders_devices(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay_app.DEVICES["win-fukuoka"] = record("win-fukuoka")
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+    timestamps = iter(
+        [
+            "2026-07-11T01:00:00.123Z",
+            "2026-07-11T01:00:01.456Z",
+        ]
+    )
+    monkeypatch.setattr(relay_app, "_now_millis", lambda: next(timestamps))
+
+    async def successful_send(_device_id: str, _text: str) -> None:
+        return None
+
+    monkeypatch.setattr(relay_app.agents, "send_clipboard", successful_send)
+
+    first = client.post(
+        "/api/send",
+        headers=headers(),
+        json={"target": "mac-china", "text": "first"},
+    )
+    second = client.post(
+        "/api/send",
+        headers=headers(),
+        json={"target": "win-fukuoka", "text": "second"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert relay_app.DEVICES["mac-china"]["last_sent_at"] == "2026-07-11T01:00:00.123Z"
+    assert relay_app.DEVICES["win-fukuoka"]["last_sent_at"] == "2026-07-11T01:00:01.456Z"
+
+    listed = client.get("/api/devices", headers=headers())
+    assert [item["device_id"] for item in listed.json()] == [
+        "win-fukuoka",
+        "mac-china",
+    ]
+    assert all("last_sent_at" not in item for item in listed.json())
+
+    stored = json.loads(relay_app.DEVICES_FILE.read_text(encoding="utf-8"))
+    stored_by_id = {item["device_id"]: item for item in stored["devices"]}
+    assert stored_by_id["mac-china"]["last_sent_at"] == "2026-07-11T01:00:00.123Z"
+    assert stored_by_id["win-fukuoka"]["last_sent_at"] == "2026-07-11T01:00:01.456Z"
+    reloaded = relay_app._load_devices(relay_app.DEVICES_FILE)
+    assert reloaded["win-fukuoka"]["last_sent_at"] == "2026-07-11T01:00:01.456Z"
+
+
+def test_failed_send_does_not_update_last_sent(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relay_app.DEVICES["mac-china"] = record("mac-china")
+
+    async def failed_send(_device_id: str, _text: str) -> None:
+        raise RuntimeError("agent offline")
+
+    monkeypatch.setattr(relay_app.agents, "send_clipboard", failed_send)
+
+    response = client.post(
+        "/api/send",
+        headers=headers(),
+        json={"target": "mac-china", "text": "not delivered"},
+    )
+
+    assert response.status_code == 503
+    assert "last_sent_at" not in relay_app.DEVICES["mac-china"]
+
+
 def test_measure_latency_records_rtt_when_agent_pongs() -> None:
     class FakeWebSocket:
         def __init__(self) -> None:

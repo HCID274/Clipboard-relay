@@ -63,3 +63,51 @@ def test_latency_only_refresh_does_not_rebuild_rows() -> None:
     assert "updateLatenciesOnly();" in page
     # 快照到达仍走 render，但结构未变时应 early-return 到 latency-only 路径
     assert "lastStructureKey === key" in page
+
+
+def test_last_sent_cache_uses_one_expiring_session_storage_entry() -> None:
+    """仅在当前标签页短期缓存最近一条发送记录。"""
+    page = read_ui_page()
+
+    assert 'LAST_SENT_STORAGE_KEY = "clipboardRelayLastSent"' in page
+    assert "LAST_SENT_TTL_MS = 10 * 60 * 1000" in page
+    assert page.count("sessionStorage.setItem(LAST_SENT_STORAGE_KEY") == 1
+    assert "sessionStorage.getItem(LAST_SENT_STORAGE_KEY)" in page
+    assert "sessionStorage.removeItem(LAST_SENT_STORAGE_KEY)" in page
+    assert "cached.expiresAt <= Date.now()" in page
+    assert "localStorage.setItem(LAST_SENT_STORAGE_KEY" not in page
+
+
+def test_successful_send_caches_exact_text_and_target_before_clearing_input() -> None:
+    page = read_ui_page()
+    send_start = page.index('sendButton.addEventListener("click"')
+    success_position = page.index("if (response.ok)", send_start)
+    cache_position = page.index("rememberLastSent(text, sendTarget);", success_position)
+    clear_position = page.index('textInput.value = "";', success_position)
+
+    assert 'const sendTarget = target;' in page[send_start:success_position]
+    assert "JSON.stringify({ target: sendTarget, text })" in page[send_start:success_position]
+    assert success_position < cache_position < clear_position
+    assert 'setStatus("已发送至 " + sendTarget + "。", "ok")' in page
+
+
+def test_resend_action_restores_text_and_opens_target_picker() -> None:
+    page = read_ui_page()
+    resend_start = page.index('resendLastButton.addEventListener("click"')
+    resend_end = page.index("authForm.addEventListener", resend_start)
+    resend_handler = page[resend_start:resend_end]
+
+    assert 'id="resendLast"' in page
+    assert "textInput.value = lastSent.text;" in resend_handler
+    assert "targetOpen = true;" in resend_handler
+    assert "updateTargetOpenUI();" in resend_handler
+    assert "请选择正确设备后发送" in resend_handler
+    assert "clearLastSent();" in page[page.index("function clearCachedPassword"):]
+
+
+def test_resend_button_has_a_mobile_friendly_touch_target() -> None:
+    page = read_ui_page()
+
+    assert "min-width: 88px" in page
+    assert "min-height: 44px" in page
+    assert "padding: 10px 16px" in page

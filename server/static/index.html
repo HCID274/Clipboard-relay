@@ -443,8 +443,11 @@
       #send:active { transform: scale(.97); }
       #send:disabled { filter: saturate(.5); opacity: .7; }
       #send.sent { animation: fadeInUp .5s ease backwards, successPulse .6s ease; animation-delay: 210ms, 0s; }
+      #sendLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #sendIcon { font-size: 18px; line-height: 1; display: inline-block; }
       #sendIcon.pop { animation: popIn .4s cubic-bezier(.34,1.56,.64,1); }
+
+      .target-row:disabled, .picker-row:disabled { cursor: default; opacity: .68; }
 
       #status {
         min-height: 20px;
@@ -456,6 +459,45 @@
       }
       #status.ok { color: #35c26b; animation: itemIn .25s ease; }
       #status.bad { color: #ef5350; animation: itemIn .25s ease; }
+
+      .resend-bar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 44px;
+        margin-top: 4px;
+        padding-top: 10px;
+        border-top: 1px solid #2a2e33;
+        animation: itemIn .25s ease;
+      }
+      .resend-bar[hidden] { display: none; }
+      .resend-summary {
+        flex: 1;
+        min-width: 0;
+        color: #8b9198;
+        font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .resend-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        min-width: 88px;
+        min-height: 44px;
+        border: 1px solid #3d4249;
+        border-radius: 10px;
+        padding: 10px 16px;
+        color: #f2f3f5;
+        background: transparent;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 14px;
+        font-weight: 700;
+      }
+      .resend-btn:active { transform: scale(.96); }
 
       .backdrop {
         position: fixed; inset: 0;
@@ -662,6 +704,13 @@
         <span id="sendIcon">→</span>
       </button>
       <div id="status" aria-live="polite"></div>
+      <div id="resendBar" class="resend-bar" hidden>
+        <span id="resendSummary" class="resend-summary mono"></span>
+        <button type="button" id="resendLast" class="resend-btn" aria-label="恢复上次发送内容并改发到其他设备">
+          <span aria-hidden="true">↻</span>
+          <span>改发</span>
+        </button>
+      </div>
     </main>
 
     <div class="backdrop" id="backdrop"></div>
@@ -694,6 +743,8 @@
     <script>
       const API_KEY_STORAGE_KEY = "clipboardRelayApiKey";
       const TARGET_STORAGE_KEY = "clipboardRelayTarget";
+      const LAST_SENT_STORAGE_KEY = "clipboardRelayLastSent";
+      const LAST_SENT_TTL_MS = 10 * 60 * 1000;
       const INVALID_CACHED_PASSWORD_MESSAGE = "保存的密码已失效，请重新验证。";
 
       const clearKeyButton = document.querySelector("#clearKey");
@@ -702,6 +753,9 @@
       const sendLabelEl = document.querySelector("#sendLabel");
       const sendIconEl = document.querySelector("#sendIcon");
       const statusEl = document.querySelector("#status");
+      const resendBar = document.querySelector("#resendBar");
+      const resendSummary = document.querySelector("#resendSummary");
+      const resendLastButton = document.querySelector("#resendLast");
       const gearBtn = document.querySelector("#gearBtn");
       const onlineBadge = document.querySelector("#onlineBadge");
       const targetRow = document.querySelector("#targetRow");
@@ -730,10 +784,97 @@
       let latestUiConnectionId = 0;
       let latestSnapshotVersion = -1;
       let apiKey = localStorage.getItem(API_KEY_STORAGE_KEY)?.trim() || "";
+      let sending = false;
+      let sendFeedbackTimer = null;
+      let lastSentExpiryTimer = null;
 
       function setStatus(message, kind) {
         statusEl.textContent = message;
         statusEl.className = kind || "";
+      }
+
+      function idleSendLabel() {
+        return target ? "发送到 " + target : "发送到剪贴板";
+      }
+
+      function updateIdleSendLabel() {
+        if (!sending && !sendButton.classList.contains("sent")) {
+          sendLabelEl.textContent = idleSendLabel();
+        }
+      }
+
+      function clearLastSent() {
+        window.clearTimeout(lastSentExpiryTimer);
+        lastSentExpiryTimer = null;
+        try {
+          sessionStorage.removeItem(LAST_SENT_STORAGE_KEY);
+        } catch (_error) {
+          // sessionStorage 可能被浏览器隐私策略禁用；界面仍应可正常发送。
+        }
+        resendSummary.textContent = "";
+        resendBar.hidden = true;
+      }
+
+      function getLastSent() {
+        let raw;
+        try {
+          raw = sessionStorage.getItem(LAST_SENT_STORAGE_KEY);
+        } catch (_error) {
+          return null;
+        }
+        if (!raw) return null;
+        try {
+          const cached = JSON.parse(raw);
+          if (
+            !cached ||
+            typeof cached.text !== "string" ||
+            typeof cached.target !== "string" ||
+            !Number.isFinite(cached.expiresAt) ||
+            cached.expiresAt <= Date.now()
+          ) {
+            clearLastSent();
+            return null;
+          }
+          return cached;
+        } catch (_error) {
+          clearLastSent();
+          return null;
+        }
+      }
+
+      function renderLastSent() {
+        const cached = getLastSent();
+        if (!cached) {
+          resendBar.hidden = true;
+          return;
+        }
+        resendSummary.textContent = "上次已发送至 " + cached.target;
+        resendBar.hidden = false;
+        window.clearTimeout(lastSentExpiryTimer);
+        lastSentExpiryTimer = window.setTimeout(clearLastSent, cached.expiresAt - Date.now());
+      }
+
+      function rememberLastSent(text, sentTarget) {
+        const sentAt = Date.now();
+        try {
+          sessionStorage.setItem(LAST_SENT_STORAGE_KEY, JSON.stringify({
+            text,
+            target: sentTarget,
+            sentAt,
+            expiresAt: sentAt + LAST_SENT_TTL_MS,
+          }));
+        } catch (_error) {
+          clearLastSent();
+          return;
+        }
+        renderLastSent();
+      }
+
+      function setTargetControlsDisabled(disabled) {
+        targetRow.disabled = disabled;
+        targetList.querySelectorAll(".picker-row").forEach((row) => {
+          row.disabled = disabled;
+        });
       }
 
       function setAuthFeedback(message, kind = "") {
@@ -756,6 +897,7 @@
 
       function clearCachedPassword(message) {
         localStorage.removeItem(API_KEY_STORAGE_KEY);
+        clearLastSent();
         apiKey = "";
         resetDevices();
         ++latestUiConnectionId;
@@ -852,6 +994,8 @@
 
       function updateLatenciesOnly() {
         const dev = devices.find((d) => d.device_id === target);
+        updateIdleSendLabel();
+        targetRow.disabled = sending;
         setLatencyEl(selLatency, dev ? getLatencyMs(dev) : null, { animate: true });
 
         devices.forEach((d) => {
@@ -877,6 +1021,8 @@
           target = devices[0] ? devices[0].device_id : "";
         }
         const dev = devices.find((d) => d.device_id === target);
+        updateIdleSendLabel();
+        targetRow.disabled = sending;
 
         // selected row summary（非 latency 字段）
         selDot.className = "dot big" + (dev ? (dev.online ? " online" : " offline") : "");
@@ -899,6 +1045,7 @@
           row.type = "button";
           row.dataset.deviceId = d.device_id;
           row.className = "picker-row" + (d.device_id === target ? " selected" : "");
+          row.disabled = sending;
           const dms = getLatencyMs(d);
           const dot = makeElement("span", "dot " + presenceClass(d.online));
           const name = makeElement("span", "name", d.device_id);
@@ -985,6 +1132,20 @@
 
       clearKeyButton.addEventListener("click", () => {
         clearCachedPassword("密码已清除，请重新验证后继续使用。");
+      });
+
+      resendLastButton.addEventListener("click", () => {
+        const lastSent = getLastSent();
+        if (!lastSent) {
+          renderLastSent();
+          setStatus("上次发送记录已过期。", "bad");
+          return;
+        }
+        textInput.value = lastSent.text;
+        targetOpen = true;
+        updateTargetOpenUI();
+        setStatus("已恢复上次内容，请选择正确设备后发送。", "ok");
+        targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
       });
 
       authForm.addEventListener("submit", async (event) => {
@@ -1117,13 +1278,19 @@
 
       sendButton.addEventListener("click", async () => {
         const text = textInput.value;
+        const sendTarget = target;
 
         if (!apiKey) { showAuthGate("请先验证访问密码。"); return; }
-        if (!target) { setStatus("当前没有可用设备。", "bad"); return; }
+        if (!sendTarget) { setStatus("当前没有可用设备。", "bad"); return; }
         if (!text.trim()) { setStatus("请输入要发送的文本。", "bad"); return; }
 
-        localStorage.setItem(TARGET_STORAGE_KEY, target);
+        localStorage.setItem(TARGET_STORAGE_KEY, sendTarget);
+        window.clearTimeout(sendFeedbackTimer);
+        sendButton.classList.remove("sent");
+        sendIconEl.classList.remove("pop");
+        sending = true;
         sendButton.disabled = true;
+        setTargetControlsDisabled(true);
         sendLabelEl.textContent = "发送中…";
         setStatus("发送中...", "");
 
@@ -1131,18 +1298,19 @@
           const response = await fetch("/api/send", {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
-            body: JSON.stringify({ target, text }),
+            body: JSON.stringify({ target: sendTarget, text }),
           });
 
           if (response.ok) {
+            rememberLastSent(text, sendTarget);
             textInput.value = "";
-            setStatus("发送成功。", "ok");
+            setStatus("已发送至 " + sendTarget + "。", "ok");
             sendLabelEl.textContent = "已发送";
             sendIconEl.textContent = "✓";
             sendIconEl.classList.add("pop");
             sendButton.classList.add("sent");
-            setTimeout(() => {
-              sendLabelEl.textContent = "发送到剪贴板";
+            sendFeedbackTimer = window.setTimeout(() => {
+              sendLabelEl.textContent = idleSendLabel();
               sendIconEl.textContent = "→";
               sendIconEl.classList.remove("pop");
               sendButton.classList.remove("sent");
@@ -1159,12 +1327,15 @@
         } catch (error) {
           setStatus("网络连接失败。", "bad");
         } finally {
+          sending = false;
           sendButton.disabled = false;
-          if (sendLabelEl.textContent === "发送中…") sendLabelEl.textContent = "发送到剪贴板";
+          setTargetControlsDisabled(false);
+          if (sendLabelEl.textContent === "发送中…") updateIdleSendLabel();
         }
       });
 
       render();
+      renderLastSent();
       if (apiKey) {
         scheduleUiConnection();
       } else {
